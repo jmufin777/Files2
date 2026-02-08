@@ -6,7 +6,7 @@ const ApexChart = dynamic(() => import("react-apexcharts"), {
   ssr: false,
 });
 
-type ChartType = "pie" | "bar";
+type ChartType = "pie" | "bar" | "line";
 
 type ResultsChartProps = {
   title: string;
@@ -43,6 +43,29 @@ export default function ResultsChart({
               labels,
               legend: { position: "bottom" },
               theme: { mode: "dark" },
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (chartType === "line") {
+    return (
+      <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+        <h3 className="text-sm font-semibold text-slate-200">{title}</h3>
+        <div className="mt-4">
+          <ApexChart
+            type="line"
+            height={320}
+            series={[{ name: "Hodnota", data: series }]}
+            options={{
+              xaxis: { categories: labels },
+              stroke: { curve: "smooth", width: 3 },
+              markers: { size: 0 },
+              legend: { position: "bottom" },
+              theme: { mode: "dark" },
+              tooltip: { shared: true },
             }}
           />
         </div>

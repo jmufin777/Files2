@@ -9,6 +9,7 @@ type SambaRequest = {
   recursive?: boolean;
   maxFiles?: number;
   extensions?: string[]; // např. ["pdf", "docx"]
+  maxDepth?: number;
 };
 
 export async function POST(request: Request) {
@@ -16,6 +17,7 @@ export async function POST(request: Request) {
     sambaPath: "",
     recursive: true,
     maxFiles: 1000,
+    maxDepth: 25,
   };
 
   try {
@@ -24,7 +26,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid JSON." }, { status: 400 });
   }
 
-  const { sambaPath, recursive = true, maxFiles = 1000, extensions } = payload;
+  const {
+    sambaPath,
+    recursive = true,
+    maxFiles = 1000,
+    extensions,
+    maxDepth = 25,
+  } = payload;
 
   // Podpora jednoduché masky v poli na konci cesty, např. "/mnt/share [pdf]" nebo "/mnt/share [pdf, docx]"
   let effectiveSambaPath = sambaPath;
@@ -47,6 +55,27 @@ export async function POST(request: Request) {
     );
   }
 
+  // Fail fast if the path is invalid or inaccessible.
+  try {
+    const st = statSync(effectiveSambaPath);
+    if (!st.isDirectory()) {
+      return NextResponse.json(
+        { error: `Samba path is not a directory: ${effectiveSambaPath}` },
+        { status: 400 }
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json(
+      {
+        error: `Cannot access sambaPath: ${effectiveSambaPath}. ${message}`,
+        hint:
+          "Check that the path exists on the server running Next.js and that it has read permissions (mount + ACL).",
+      },
+      { status: 500 }
+    );
+  }
+
   try {
     const files: Array<{
       path: string;
@@ -63,7 +92,7 @@ export async function POST(request: Request) {
       depth: number = 0
     ): void {
       if (files.length >= maxFiles) return;
-      if (depth > 10) return; // Zvýšený limit hloubky pro home složky
+      if (depth > maxDepth) return;
 
       const SKIP_DIRS = [
         "node_modules",

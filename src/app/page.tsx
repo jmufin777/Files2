@@ -11,6 +11,23 @@ type FileEntry = {
   modified?: string;
 };
 
+type SambaEntry = {
+  path: string;
+  name: string;
+  size: number;
+  type: "file" | "directory";
+  modified?: string;
+  created?: string;
+};
+
+type SambaStats = {
+  totalFiles: number;
+  totalDirectories?: number;
+  totalSize?: number;
+  totalSizeGB?: string;
+  scannedLimit?: boolean;
+};
+
 type FileContext = {
   path: string;
   content: string;
@@ -24,7 +41,7 @@ type ChatMessage = {
   text: string;
 };
 
-type ChartType = "pie" | "bar";
+type ChartType = "pie" | "bar" | "line";
 type ChartSource = "results" | "samba";
 type AssistantChart = {
   title: string;
@@ -56,16 +73,456 @@ type SavedContext = {
   notifyOnSync: boolean;
   lastIndexedAt?: string;
   files: Record<string, SavedFileMeta>;
+  uiPaths?: string[];
+};
+
+type IndexStatusResponse = {
+  tableExists?: boolean;
+  hasAnyIndex?: boolean;
+  hasContextIndex?: boolean;
+  error?: string;
 };
 
 const MAX_FILE_BYTES = 200_000;
 const MAX_CONTEXT_CHARS = 20_000;
 const SEARCH_BATCH_SIZE = 25;
 const REQUEST_TIMEOUT_MS = 20_000;
+const CHAT_REQUEST_TIMEOUT_MS = 90_000;
 const SKIP_DIRS = new Set(["node_modules", ".git", ".next", "dist", "build"]);
 const DEFAULT_OCR_MAX_PAGES = 5;
 const OCR_BATCH_SIZE = 5;
 const CONTEXTS_STORAGE_KEY = "nai.savedContexts.v1";
+
+type CachedTextRecord = {
+  path: string;
+  text: string;
+  size: number;
+  modified?: string;
+  created?: string;
+  storedAt: number;
+};
+
+const TEXT_CACHE_DB = "nai.textCache.v1";
+const TEXT_CACHE_STORE = "texts";
+
+function openTextCacheDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("indexedDB is not available"));
+      return;
+    }
+    const req = indexedDB.open(TEXT_CACHE_DB, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(TEXT_CACHE_STORE)) {
+        db.createObjectStore(TEXT_CACHE_STORE, { keyPath: "path" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error("Failed to open cache"));
+  });
+}
+
+async function cachePutText(record: CachedTextRecord): Promise<void> {
+  const db = await openTextCacheDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(TEXT_CACHE_STORE, "readwrite");
+    const store = tx.objectStore(TEXT_CACHE_STORE);
+    store.put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("Cache put failed"));
+    tx.onabort = () => reject(tx.error ?? new Error("Cache put aborted"));
+  });
+}
+
+async function cacheGetText(path: string): Promise<CachedTextRecord | null> {
+  const db = await openTextCacheDb();
+  return await new Promise<CachedTextRecord | null>((resolve, reject) => {
+    const tx = db.transaction(TEXT_CACHE_STORE, "readonly");
+    const store = tx.objectStore(TEXT_CACHE_STORE);
+    const req = store.get(path);
+    req.onsuccess = () => resolve((req.result as CachedTextRecord) ?? null);
+    req.onerror = () => reject(req.error ?? new Error("Cache get failed"));
+  });
+}
+
+function generateUUID(): string {
+  const cryptoObj = globalThis.crypto as Crypto | undefined;
+  if (cryptoObj?.randomUUID) return cryptoObj.randomUUID();
+  if (cryptoObj?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    cryptoObj.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
+    return (
+      hex.slice(0, 4).join("") +
+      "-" +
+      hex.slice(4, 6).join("") +
+      "-" +
+      hex.slice(6, 8).join("") +
+      "-" +
+      hex.slice(8, 10).join("") +
+      "-" +
+      hex.slice(10, 16).join("")
+    );
+  }
+  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (true) {
+    const found = haystack.indexOf(needle, index);
+    if (found === -1) break;
+    count += 1;
+    index = found + needle.length;
+  }
+  return count;
+}
+
+function extractCountNeedle(message: string): string | null {
+  const trimmed = message.trim();
+  if (!trimmed) return null;
+
+  // Prefer quoted text: "orderid"
+  const quoted = trimmed.match(/["'`´“”]([^"'`´“”]+)["'`´“”]/);
+  if (quoted?.[1]) return quoted[1].trim();
+
+  // Otherwise take the last token
+  const STOPWORDS = new Set([
+    // Czech / English filler words that frequently appear at the end
+    "kolik",
+    "soubor",
+    "souborech",
+    "souboru",
+    "ve",
+    "v",
+    "vsech",
+    "všech",
+    "jich",
+    "je",
+    "jsou",
+    "celkem",
+    "kolikrat",
+    "kolikrát",
+    "vyskytu",
+    "výskytů",
+    "vyskyt",
+    "výskyt",
+    "prvni",
+    "první",
+    "sloupec",
+    "sloupci",
+    "column",
+    "first",
+    "the",
+    "a",
+    "an",
+    "to",
+    "of",
+    "and",
+    "or",
+    "in",
+    "on",
+    "for",
+    "with",
+  ]);
+
+  const tokens = trimmed.match(/[a-z0-9_]{2,}/gi) ?? [];
+  for (let i = tokens.length - 1; i >= 0; i -= 1) {
+    const token = tokens[i].trim();
+    if (!token) continue;
+    if (STOPWORDS.has(token.toLowerCase())) continue;
+    return token;
+  }
+
+  // Fallback: last token cleanup
+  const lastToken = trimmed.split(/\s+/).pop();
+  if (!lastToken) return null;
+  const cleaned = lastToken.replace(/^[^a-z0-9_]+|[^a-z0-9_]+$/gi, "");
+  return cleaned || null;
+}
+
+function countLinesFast(text: string): number {
+  const normalized = text.replace(/\r\n?/g, "\n");
+  // Trim only trailing whitespace/newlines so we don't count a final empty line.
+  const trimmedEnd = normalized.replace(/[\s\n]+$/g, "");
+  if (!trimmedEnd) return 0;
+  let count = 1;
+  for (let i = 0; i < trimmedEnd.length; i += 1) {
+    if (trimmedEnd[i] === "\n") count += 1;
+  }
+  return count;
+}
+
+function detectCsvDelimiter(headerLine: string): "," | ";" | "\t" {
+  const comma = (headerLine.match(/,/g) ?? []).length;
+  const semicolon = (headerLine.match(/;/g) ?? []).length;
+  const tab = (headerLine.match(/\t/g) ?? []).length;
+  if (semicolon >= comma && semicolon >= tab) return ";";
+  if (tab >= comma && tab >= semicolon) return "\t";
+  return ",";
+}
+
+function looksLikeDelimitedText(text: string): boolean {
+  // Rough heuristic: enough newlines and a common delimiter.
+  if (!text) return false;
+  const lineBreaks = (text.match(/\n/g) ?? []).length;
+  if (lineBreaks < 2) return false;
+  return text.includes(",") || text.includes(";") || text.includes("\t");
+}
+
+function parseCsvLine(line: string, delimiter: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+        continue;
+      }
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (!inQuotes && ch === delimiter) {
+      out.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  out.push(current.trim());
+  return out;
+}
+
+function normalizeHeaderToken(token: string): string {
+  return token
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9_]/g, "");
+}
+
+function findHeaderIndex(headerFields: string[], candidates: string[]): number {
+  const normalizedHeader = headerFields.map(normalizeHeaderToken);
+  const normalizedCandidates = candidates.map(normalizeHeaderToken);
+  for (let i = 0; i < normalizedHeader.length; i += 1) {
+    const h = normalizedHeader[i];
+    if (!h) continue;
+    if (normalizedCandidates.includes(h)) return i;
+  }
+  return -1;
+}
+
+function parseYearMonth(value: string): string | null {
+  const v = value.trim();
+  if (!v) return null;
+
+  // ISO-ish: 2025-12-31 or 2025-12
+  const iso = v.match(/\b(\d{4})-(\d{2})\b/);
+  if (iso) return `${iso[1]}-${iso[2]}`;
+
+  // Czech: 31.12.2025 or 31. 12. 2025
+  const cz = v.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+  if (cz) {
+    const month = String(Math.max(1, Math.min(12, Number(cz[2]) || 0))).padStart(2, "0");
+    return `${cz[3]}-${month}`;
+  }
+
+  // Slash: 12/31/2025 or 31/12/2025 (we assume if first > 12 then it's DD/MM)
+  const slash = v.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/);
+  if (slash) {
+    const a = Number(slash[1]);
+    const b = Number(slash[2]);
+    const year = slash[3];
+    const monthNum = a > 12 ? b : a;
+    const month = String(Math.max(1, Math.min(12, monthNum || 0))).padStart(2, "0");
+    return `${year}-${month}`;
+  }
+
+  // Fallback to Date.parse (handles many formats including RFC/ISO with time)
+  const t = Date.parse(v);
+  if (!Number.isNaN(t)) {
+    const d = new Date(t);
+    const year = d.getUTCFullYear();
+    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+    if (year >= 1970 && year <= 2100) return `${year}-${month}`;
+  }
+
+  return null;
+}
+
+type OrdersByMonthResult = {
+  byMonth: Array<{ ym: string; count: number }>;
+  filesUsed: number;
+  rowsUsed: number;
+  rowsSkipped: number;
+  usedUniqueOrderIds: boolean;
+  notes: string[];
+};
+
+async function computeOrdersByYearMonth(
+  fileContext: FileContext[],
+  signal?: AbortSignal
+): Promise<OrdersByMonthResult> {
+  const orderIdCandidates = [
+    "orderid",
+    "order_id",
+    "ordernumber",
+    "order_number",
+    "objednavkaid",
+    "objednavka_id",
+    "idobjednavky",
+  ];
+  const dateCandidates = [
+    "date",
+    "datum",
+    "orderdate",
+    "order_date",
+    "createdat",
+    "created_at",
+    "timestamp",
+    "time",
+    "order_time",
+  ];
+
+  const notes: string[] = [];
+  const countByMonth = new Map<string, number>();
+  const setsByMonth = new Map<string, Set<string>>();
+  const MAX_UNIQUE_PER_MONTH = 200_000;
+  let usedUniqueOrderIds = true;
+  let filesUsed = 0;
+  let rowsUsed = 0;
+  let rowsSkipped = 0;
+
+  for (let fi = 0; fi < fileContext.length; fi += 1) {
+    if (signal?.aborted) {
+      notes.push("Výpočet byl zrušen (abort).");
+      break;
+    }
+    const f = fileContext[fi];
+    const isLikelyCsv = /\.(csv|tsv)(\s|$)/i.test(f.path) || looksLikeDelimitedText(f.content);
+    if (!isLikelyCsv) continue;
+
+    const lines = f.content
+      .replace(/\r\n?/g, "\n")
+      .split("\n")
+      .filter((l) => l.trim().length > 0);
+    if (lines.length < 2) continue;
+
+    const delimiter = detectCsvDelimiter(lines[0]);
+    const headerFields = parseCsvLine(lines[0], delimiter).map((x) => x.trim());
+    if (headerFields.length < 2) continue;
+
+    const orderIdx = findHeaderIndex(headerFields, orderIdCandidates);
+    const dateIdx = findHeaderIndex(headerFields, dateCandidates);
+    if (dateIdx < 0) continue;
+
+    filesUsed += 1;
+
+    for (let li = 1; li < lines.length; li += 1) {
+      const row = parseCsvLine(lines[li], delimiter);
+      const dateVal = (row[dateIdx] ?? "").trim();
+      const ym = parseYearMonth(dateVal);
+      if (!ym) {
+        rowsSkipped += 1;
+        continue;
+      }
+
+      if (orderIdx >= 0 && usedUniqueOrderIds) {
+        const orderId = (row[orderIdx] ?? "").trim();
+        if (!orderId) {
+          rowsSkipped += 1;
+          continue;
+        }
+        let s = setsByMonth.get(ym);
+        if (!s) {
+          s = new Set<string>();
+          setsByMonth.set(ym, s);
+        }
+        s.add(orderId);
+        // Safety valve for very large datasets
+        if (s.size > MAX_UNIQUE_PER_MONTH) {
+          usedUniqueOrderIds = false;
+          notes.push(
+            `Měsíc ${ym} překročil ${MAX_UNIQUE_PER_MONTH} unikátních orderId; přepínám na počítání řádků (bez deduplikace).`
+          );
+          setsByMonth.clear();
+        }
+      } else {
+        countByMonth.set(ym, (countByMonth.get(ym) ?? 0) + 1);
+      }
+      rowsUsed += 1;
+    }
+
+    if (fi % 25 === 0) {
+      // Yield to keep UI responsive
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  if (usedUniqueOrderIds) {
+    for (const [ym, set] of setsByMonth.entries()) {
+      countByMonth.set(ym, set.size);
+    }
+  }
+
+  const byMonth = Array.from(countByMonth.entries())
+    .map(([ym, count]) => ({ ym, count }))
+    .sort((a, b) => a.ym.localeCompare(b.ym));
+
+  if (filesUsed === 0) {
+    notes.push(
+      "Nenašel jsem v kontextu CSV/TSV se sloupcem pro datum. Zkontrolujte, že CSV obsahují hlavičku a sloupec datum/order_date."
+    );
+  } else if (byMonth.length === 0) {
+    notes.push(
+      "Našel jsem sice soubory, ale nepodařilo se z nich vyparsovat žádné platné datum (rok-měsíc)."
+    );
+  }
+
+  return {
+    byMonth,
+    filesUsed,
+    rowsUsed,
+    rowsSkipped,
+    usedUniqueOrderIds,
+    notes,
+  };
+}
+
+function countCsvColumnValues(text: string, columnName: string | null): number {
+  const lines = text
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .filter((l) => l.trim().length > 0);
+  if (lines.length < 2) return 0;
+
+  const header = lines[0];
+  const delimiter = detectCsvDelimiter(header);
+  const headerFields = parseCsvLine(header, delimiter).map((f) => f.trim());
+
+  let columnIndex = 0;
+  if (columnName) {
+    const normalized = columnName.trim().toLowerCase();
+    const idx = headerFields.findIndex((f) => f.toLowerCase() === normalized);
+    if (idx >= 0) columnIndex = idx;
+  }
+
+  let count = 0;
+  for (let i = 1; i < lines.length; i += 1) {
+    const row = parseCsvLine(lines[i], delimiter);
+    const value = (row[columnIndex] ?? "").trim();
+    if (value.length > 0) count += 1;
+  }
+  return count;
+}
 
 async function collectFiles(
   dirHandle: FileSystemDirectoryHandle,
@@ -96,6 +553,68 @@ async function collectFiles(
   return entries;
 }
 
+function getFileExtensionFromPath(path: string): string {
+  const name = path.split("/").pop() ?? path;
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === name.length - 1) {
+    return "";
+  }
+  return name.slice(dotIndex + 1).toLowerCase();
+}
+
+async function readXlsxText(file: File, maxChars: number): Promise<string> {
+  const XLSX = await import("xlsx");
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, {
+    type: "array",
+    cellText: false,
+    cellDates: true,
+  });
+
+  const textParts: string[] = [];
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    textParts.push(`Sheet: ${sheetName}\n`);
+    const csvContent = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+    if (csvContent.trim().length > 0) {
+      textParts.push(csvContent);
+    }
+    if (textParts.join("\n").length >= maxChars) {
+      break;
+    }
+  }
+
+  const output = textParts.join("\n").trim();
+  if (output.length > maxChars) {
+    return `${output.slice(0, maxChars)}\n\n[Truncated to ${maxChars} chars]`;
+  }
+  return output;
+}
+
+async function readDocxText(file: File, maxChars: number): Promise<string> {
+  const JSZip = (await import("jszip")).default;
+  const buffer = await file.arrayBuffer();
+  const zip = new JSZip();
+  await zip.loadAsync(buffer);
+  const xmlFile = zip.file("word/document.xml");
+  if (!xmlFile) {
+    throw new Error("Invalid DOCX file");
+  }
+  const xmlContent = await xmlFile.async("text");
+  const text = xmlContent
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .trim();
+
+  if (text.length > maxChars) {
+    return `${text.slice(0, maxChars)}\n\n[Truncated to ${maxChars} chars]`;
+  }
+  return text;
+}
+
 async function readFileText(
   entry: FileEntry,
   maxBytes = MAX_FILE_BYTES,
@@ -108,6 +627,7 @@ async function readFileText(
   if (!file) {
     throw new Error("Missing file handle");
   }
+  const ext = getFileExtensionFromPath(entry.path);
   const isPdf =
     file.type === "application/pdf" ||
     entry.path.toLowerCase().endsWith(".pdf");
@@ -119,6 +639,12 @@ async function readFileText(
       onProgress
     );
     return text;
+  }
+  if (ext === "xlsx" || ext === "xls") {
+    return await readXlsxText(file, maxBytes);
+  }
+  if (ext === "docx") {
+    return await readDocxText(file, maxBytes);
   }
   const blob = file.size > maxBytes ? file.slice(0, maxBytes) : file;
   const text = await blob.text();
@@ -173,7 +699,7 @@ async function readPdfText(
 }
 
 async function ocrPdfText(
-  doc: { numPages: number; getPage: (n: number) => Promise<any> },
+  doc: { numPages: number; getPage: (n: number) => Promise<unknown> },
   maxChars: number,
   ocrMaxPages: number,
   onProgress?: (percent: number, label: string) => void
@@ -186,7 +712,14 @@ async function ocrPdfText(
   const maxPages = Math.min(doc.numPages, Math.max(1, ocrMaxPages));
 
   for (let pageNumber = 1; pageNumber <= maxPages; pageNumber += 1) {
-    const page = await doc.getPage(pageNumber);
+    const page = (await doc.getPage(pageNumber)) as {
+      getViewport: (o: { scale: number }) => { width: number; height: number };
+      render: (o: {
+        canvasContext: CanvasRenderingContext2D;
+        viewport: { width: number; height: number };
+      }) => { promise: Promise<unknown> };
+    };
+
     const viewport = page.getViewport({ scale: 1.5 });
     const canvas = document.createElement("canvas");
     const context = canvas.getContext("2d");
@@ -218,6 +751,9 @@ async function ocrPdfText(
 }
 
 function buildContext(files: FileContext[]): string {
+  const TRUNC_MARKER = "\n\n[Context truncated]";
+  const effectiveLimit = Math.max(0, MAX_CONTEXT_CHARS - TRUNC_MARKER.length);
+
   let output = "";
   const totalSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
   const summaryLines: string[] = [
@@ -241,23 +777,38 @@ function buildContext(files: FileContext[]): string {
     listCount += 1;
   }
 
-  output = summaryLines.join("\n");
+  const summaryString = summaryLines.join("\n");
+  output = summaryString.slice(0, effectiveLimit);
+
+  let truncated = output.length < summaryString.length;
   for (const file of files) {
+    if (truncated) break;
+
     const meta: string[] = [];
     meta.push(`size_bytes=${file.size}`);
     if (file.modified) meta.push(`modified=${file.modified}`);
     if (file.created) meta.push(`created=${file.created}`);
     const header = meta.length > 0 ? `${file.path} (${meta.join(", ")})` : file.path;
-    const next = `# ${header}\n${file.content}`;
-    if (output.length + next.length > MAX_CONTEXT_CHARS) {
-      const remaining = MAX_CONTEXT_CHARS - output.length;
-      if (remaining > 0) {
-        output += `\n\n${next.slice(0, remaining)}`;
-      }
-      output += "\n\n[Context truncated]";
-      break;
+    const section = `# ${header}\n${file.content}`;
+
+    const sep = output ? "\n\n" : "";
+    const addition = `${sep}${section}`;
+
+    if (output.length + addition.length <= effectiveLimit) {
+      output += addition;
+      continue;
     }
-    output = output ? `${output}\n\n${next}` : next;
+
+    const remaining = effectiveLimit - output.length;
+    if (remaining > 0) {
+      output += addition.slice(0, remaining);
+    }
+    truncated = true;
+  }
+
+  if (truncated) {
+    // Ensure we never exceed MAX_CONTEXT_CHARS.
+    return `${output}${TRUNC_MARKER}`.slice(0, MAX_CONTEXT_CHARS);
   }
   return output;
 }
@@ -316,12 +867,13 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [isIndexing, setIsIndexing] = useState(false);
+  const [isRebuilding, setIsRebuilding] = useState(false);
   const [isIndexed, setIsIndexed] = useState(false);
   const [selectAllChecked, setSelectAllChecked] = useState(false);
   const [sambaPath, setSambaPath] = useState<string>("");
-  const [sambaFiles, setSambaFiles] = useState<any[]>([]);
+  const [sambaFiles, setSambaFiles] = useState<SambaEntry[]>([]);
   const [isSambaScanning, setIsSambaScanning] = useState(false);
-  const [sambaStats, setSambaStats] = useState<any>(null);
+  const [sambaStats, setSambaStats] = useState<SambaStats | null>(null);
   const [autoAddSamba, setAutoAddSamba] = useState(false);
   const [autoAddLimit, setAutoAddLimit] = useState(0);
   const [sambaFilter, setSambaFilter] = useState("");
@@ -341,10 +893,39 @@ export default function Home() {
   const [newContextName, setNewContextName] = useState("");
   const [newContextSambaPath, setNewContextSambaPath] = useState("");
   const [syncProgress, setSyncProgress] = useState<LoadProgress | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
   const [indexProgress, setIndexProgress] = useState<LoadProgress | null>(null);
+  const [contextFilter, setContextFilter] = useState<string>("");
+  const [uiLoadLimit, setUiLoadLimit] = useState<number>(200);
+  const [uiLoadCacheOnly, setUiLoadCacheOnly] = useState<boolean>(true);
+  const [dbIndexStatus, setDbIndexStatus] = useState<{
+    checked: boolean;
+    hasAnyIndex: boolean;
+    hasContextIndex: boolean;
+  }>({ checked: false, hasAnyIndex: false, hasContextIndex: false });
+  const [knowledgeBase, setKnowledgeBase] = useState<{
+    initialized: boolean;
+    totalFiles: number;
+    totalChunks: number;
+    embeddingDimension: number | null;
+    lastIndexedAt: string | null;
+    readyForSearch: boolean;
+  } | null>(null);
 
   const contextText = useMemo(() => buildContext(fileContext), [fileContext]);
+
+  const filteredContext = useMemo(() => {
+    const q = contextFilter.trim().toLowerCase();
+    if (!q) return fileContext;
+    return fileContext.filter((f) => f.path.toLowerCase().includes(q));
+  }, [contextFilter, fileContext]);
+
+  const CONTEXT_DISPLAY_LIMIT = 200;
+  const displayedContext = useMemo(
+    () => filteredContext.slice(0, CONTEXT_DISPLAY_LIMIT),
+    [filteredContext]
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -365,16 +946,112 @@ export default function Home() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    window.localStorage.setItem(
-      CONTEXTS_STORAGE_KEY,
-      JSON.stringify(savedContexts)
-    );
+    try {
+      window.localStorage.setItem(
+        CONTEXTS_STORAGE_KEY,
+        JSON.stringify(savedContexts)
+      );
+    } catch (error) {
+      console.warn(
+        "Failed to persist saved contexts to localStorage:",
+        error instanceof Error ? error.message : error
+      );
+      // Don't spam status if user is actively doing something.
+      setStatus(
+        "Pozor: nepodařilo se uložit uložené kontexty do prohlížeče (quota/storage). " +
+          "Po reloadu se může znovu extrahovat obsah. Zvažte méně souborů nebo méně kontextů."
+      );
+    }
   }, [savedContexts]);
 
   const activeContext = useMemo(() => {
     if (!activeContextId) return null;
     return savedContexts.find((ctx) => ctx.id === activeContextId) ?? null;
   }, [activeContextId, savedContexts]);
+
+  const hasDbIndex = useMemo(() => {
+    return (
+      isIndexed ||
+      Boolean(activeContext?.lastIndexedAt) ||
+      dbIndexStatus.hasAnyIndex ||
+      dbIndexStatus.hasContextIndex ||
+      Boolean(knowledgeBase?.initialized)
+    );
+  }, [
+    isIndexed,
+    activeContext?.lastIndexedAt,
+    dbIndexStatus.hasAnyIndex,
+    dbIndexStatus.hasContextIndex,
+    knowledgeBase?.initialized,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let cancelled = false;
+
+    const run = async () => {
+      try {
+        const contextId = activeContext?.id ? encodeURIComponent(activeContext.id) : "";
+        const url = contextId ? `/api/index/status?contextId=${contextId}` : "/api/index/status";
+        const res = await fetch(url);
+        const data = (await res.json()) as IndexStatusResponse;
+        if (cancelled) return;
+        if (!res.ok) {
+          setDbIndexStatus({ checked: true, hasAnyIndex: false, hasContextIndex: false });
+          return;
+        }
+        setDbIndexStatus({
+          checked: true,
+          hasAnyIndex: Boolean(data.hasAnyIndex),
+          hasContextIndex: Boolean(data.hasContextIndex),
+        });
+      } catch {
+        if (cancelled) return;
+        setDbIndexStatus({ checked: true, hasAnyIndex: false, hasContextIndex: false });
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeContext?.id]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let cancelled = false;
+
+    const loadKB = async () => {
+      try {
+        const res = await fetch("/api/knowledge-base/status");
+        const data = (await res.json()) as {
+          initialized: boolean;
+          totalFiles?: number;
+          totalChunks?: number;
+          embeddingDimension?: number | null;
+          lastIndexedAt?: string | null;
+          readyForSearch?: boolean;
+        };
+        if (cancelled) return;
+        setKnowledgeBase({
+          initialized: data.initialized ?? false,
+          totalFiles: data.totalFiles ?? 0,
+          totalChunks: data.totalChunks ?? 0,
+          embeddingDimension: data.embeddingDimension ?? null,
+          lastIndexedAt: data.lastIndexedAt ?? null,
+          readyForSearch: data.readyForSearch ?? false,
+        });
+      } catch (error) {
+        if (cancelled) return;
+        console.warn("Failed to load knowledge base status:", error);
+      }
+    };
+
+    loadKB();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const chartData = useMemo(() => {
     const sourcePaths: string[] = [];
@@ -632,8 +1309,8 @@ export default function Home() {
       clearTimeout(timeoutId);
       const data = (await response.json()) as {
         success?: boolean;
-        files?: any[];
-        stats?: any;
+        files?: SambaEntry[];
+        stats?: SambaStats;
         error?: string;
       };
       if (!response.ok) {
@@ -641,7 +1318,7 @@ export default function Home() {
       }
       const files = data.files ?? [];
       setSambaFiles(files);
-      setSambaStats(data.stats);
+      setSambaStats(data.stats ?? null);
       setStatus(
         `✓ Nalezeno ${data.stats?.totalFiles} souborů (${data.stats?.totalSizeGB} GB)`
       );
@@ -697,6 +1374,17 @@ export default function Home() {
           size: data.textLength ?? 0,
         },
       ]);
+      try {
+        const text = (data.text ?? "").slice(0, MAX_FILE_BYTES);
+        await cachePutText({
+          path: filePath,
+          text,
+          size: text.length,
+          storedAt: Date.now(),
+        });
+      } catch {
+        // ignore cache errors
+      }
       setStatus(`✓ Added ${data.fileName}`);
     } catch (error) {
       setStatus(
@@ -705,7 +1393,7 @@ export default function Home() {
     }
   };
 
-  const addSambaFilesToContext = async (files: any[]) => {
+  const addSambaFilesToContext = async (files: SambaEntry[]) => {
     let filesToAdd = files.filter(
       (f) =>
         f.type === "file" &&
@@ -759,6 +1447,19 @@ export default function Home() {
               created: file.created,
             },
           ]);
+          try {
+            const text = (data.text ?? "").slice(0, MAX_FILE_BYTES);
+            await cachePutText({
+              path: file.path,
+              text,
+              size: text.length,
+              modified: file.modified,
+              created: file.created,
+              storedAt: Date.now(),
+            });
+          } catch {
+            // ignore cache errors
+          }
           added++;
         } else {
           failed++;
@@ -856,13 +1557,14 @@ export default function Home() {
       return;
     }
     const context: SavedContext = {
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       name,
       sambaPath: newContextSambaPath.trim(),
       autoSyncMinutes: 0,
       extensions: [],
       notifyOnSync: false,
       files: {},
+      uiPaths: [],
     };
     setSavedContexts((prev) => [context, ...prev]);
     setActiveContextId(context.id);
@@ -908,31 +1610,56 @@ export default function Home() {
     }
     setStatus(`Synchronizuji kontext ${activeContext.name}...`);
     setSyncProgress({ label: "Start", percent: 0 });
+    setIsSyncing(true);
     try {
-      const response = await fetch("/api/samba", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sambaPath: activeContext.sambaPath.trim(),
-          recursive: true,
-          maxFiles: 5000,
-          extensions: activeContext.extensions.length
-            ? activeContext.extensions
-            : undefined,
-        }),
-      });
+      const sambaController = new AbortController();
+      const sambaTimeoutId = window.setTimeout(
+        () => sambaController.abort(),
+        REQUEST_TIMEOUT_MS * 3
+      );
+      let response: Response;
+      try {
+        response = await fetch("/api/samba", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sambaPath: activeContext.sambaPath.trim(),
+            recursive: true,
+            maxFiles: 5000,
+            maxDepth: 30,
+            extensions: activeContext.extensions.length
+              ? activeContext.extensions
+              : undefined,
+          }),
+          signal: sambaController.signal,
+        });
+      } finally {
+        window.clearTimeout(sambaTimeoutId);
+      }
       const data = (await response.json()) as {
-        files?: any[];
+        files?: SambaEntry[];
+        stats?: SambaStats;
         error?: string;
       };
       if (!response.ok) {
         throw new Error(data.error ?? "Samba scan failed.");
       }
+
+      // Populate the Samba panel so the user sees immediate results.
+      if (Array.isArray(data.files)) {
+        setSambaFiles(data.files);
+      }
+      if (data.stats) {
+        setSambaStats(data.stats);
+      }
       const sambaFilesList = (data.files ?? []).filter(
         (file) => file.type === "file"
       );
       if (sambaFilesList.length === 0) {
-        setStatus("Nebyl nalezen žádný soubor pro indexaci.");
+        setStatus(
+          "Samba scan doběhl, ale nebyl nalezen žádný soubor k indexaci. " +
+            "Zkontrolujte přípony/filtr a jestli cesta neobsahuje jen adresáře."
+        );
         setSyncProgress(null);
         return;
       }
@@ -940,33 +1667,54 @@ export default function Home() {
       const updatedFiles = { ...activeContext.files };
       const filesToIndex: Array<{ name: string; content: string }> = [];
 
+      let unchangedCount = 0;
+      let extractedCount = 0;
+      let skippedBadExtractCount = 0;
+
       for (let index = 0; index < sambaFilesList.length; index += 1) {
         const file = sambaFilesList[index];
         const meta = updatedFiles[file.path] ?? {};
-        const unchanged =
-          meta.modified === file.modified && meta.size === file.size;
+        const sameModified =
+          (meta.modified ?? "") === String(file.modified ?? "");
+        const sameSize =
+          Number(meta.size ?? -1) === Number(file.size ?? -2);
+        const unchanged = sameModified && sameSize;
         if (unchanged) {
+          unchangedCount += 1;
           continue;
         }
         setSyncProgress({
           label: `${file.name} (${index + 1}/${sambaFilesList.length})`,
           percent: Math.round(((index + 1) / sambaFilesList.length) * 100),
         });
-        const extractResponse = await fetch("/api/extract", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            filePath: file.path,
-            fileName: file.name,
-          }),
-        });
+        const extractController = new AbortController();
+        const extractTimeoutId = window.setTimeout(
+          () => extractController.abort(),
+          REQUEST_TIMEOUT_MS * 2
+        );
+        let extractResponse: Response;
+        try {
+          extractResponse = await fetch("/api/extract", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              filePath: file.path,
+              fileName: file.name,
+            }),
+            signal: extractController.signal,
+          });
+        } finally {
+          window.clearTimeout(extractTimeoutId);
+        }
         const extractData = (await extractResponse.json()) as {
           text?: string;
           error?: string;
         };
         if (!extractResponse.ok || !extractData.text) {
+          skippedBadExtractCount += 1;
           continue;
         }
+        extractedCount += 1;
         const hash = await computeHash(extractData.text);
         if (meta.hash && meta.hash === hash) {
           updatedFiles[file.path] = {
@@ -990,7 +1738,9 @@ export default function Home() {
       }
 
       if (filesToIndex.length === 0) {
-        setStatus("Žádné změny k indexaci.");
+        setStatus(
+          `Žádné změny k indexaci. (přeskočeno beze změny: ${unchangedCount}, extrahováno: ${extractedCount}, selhalo extrahování: ${skippedBadExtractCount})`
+        );
         setSyncProgress(null);
         handleUpdateActiveContext({
           lastIndexedAt: new Date().toISOString(),
@@ -1000,16 +1750,30 @@ export default function Home() {
         return;
       }
 
-      const indexResponse = await fetch("/api/index", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          files: filesToIndex,
-          incremental: true,
-        }),
-      });
+      const indexController = new AbortController();
+      const indexTimeoutId = window.setTimeout(
+        () => indexController.abort(),
+        REQUEST_TIMEOUT_MS * 4
+      );
+      let indexResponse: Response;
+      try {
+        indexResponse = await fetch("/api/index", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            files: filesToIndex,
+            incremental: true,
+          }),
+          signal: indexController.signal,
+        });
+      } finally {
+        window.clearTimeout(indexTimeoutId);
+      }
       const indexData = (await indexResponse.json()) as {
         error?: string;
+        skippedFiles?: Array<{ name: string; reason: string }>;
+        skippedEmptyChunks?: number;
+        embeddingDimension?: number;
       };
       if (!indexResponse.ok) {
         throw new Error(indexData.error ?? "Indexing failed.");
@@ -1020,7 +1784,11 @@ export default function Home() {
         files: updatedFiles,
       });
       setIsIndexed(true);
-      setStatus(`✓ Kontext ${activeContext.name} synchronizován.`);
+      const skippedCount = indexData.skippedFiles?.length ?? 0;
+      const skippedHint = skippedCount
+        ? ` (přeskočeno ${skippedCount} souborů; typicky prázdný/nevytěžený obsah)`
+        : "";
+      setStatus(`✓ Kontext ${activeContext.name} synchronizován.${skippedHint}`);
       if (activeContext.notifyOnSync && notificationsEnabled) {
         new Notification("Synchronizace hotová", {
           body: `Kontext ${activeContext.name} byl úspěšně synchronizován.`,
@@ -1032,7 +1800,141 @@ export default function Home() {
       );
     } finally {
       setSyncProgress(null);
+      setIsSyncing(false);
     }
+  };
+
+  const getActiveContextPathsForUiLoad = (): string[] => {
+    if (!activeContext) return [];
+    const fromUi = Array.isArray(activeContext.uiPaths)
+      ? activeContext.uiPaths.filter((p) => typeof p === "string" && p.length > 0)
+      : [];
+    if (fromUi.length > 0) return fromUi;
+    return Object.keys(activeContext.files ?? {});
+  };
+
+  const handleSaveUiContextToActiveContext = () => {
+    if (!activeContext) {
+      setStatus("Vyberte kontext.");
+      return;
+    }
+    const paths = fileContext.map((f) => f.path);
+    handleUpdateActiveContext({ uiPaths: paths });
+    setStatus(`✓ Uloženo ${paths.length} souborů pro UI kontext do ${activeContext.name}.`);
+  };
+
+  const handleLoadUiContextFromActiveContext = async () => {
+    if (!activeContext) {
+      setStatus("Vyberte kontext.");
+      return;
+    }
+    const allPaths = getActiveContextPathsForUiLoad();
+    if (allPaths.length === 0) {
+      setStatus("V uloženém kontextu nejsou žádné soubory.");
+      return;
+    }
+
+    const limit = Math.max(1, Math.min(5000, uiLoadLimit || 0));
+    const paths = allPaths.slice(0, limit);
+
+    setStatus(
+      uiLoadCacheOnly
+        ? `Načítám UI kontext z cache (${paths.length})...`
+        : `Načítám UI kontext (cache + extract) (${paths.length})...`
+    );
+    setLoadProgress({ label: "Start", percent: 0 });
+
+    let loaded = 0;
+    let loadedFromCache = 0;
+    let extracted = 0;
+    let missing = 0;
+    const batch: FileContext[] = [];
+    const BATCH_FLUSH = 25;
+
+    for (let i = 0; i < paths.length; i += 1) {
+      const path = paths[i];
+      if (fileContext.some((f) => f.path === path)) {
+        continue;
+      }
+
+      const percent = Math.round(((i + 1) / paths.length) * 100);
+      setLoadProgress({ label: `${path.split("/").pop() ?? path} (${i + 1}/${paths.length})`, percent });
+
+      let text: string | null = null;
+      try {
+        const cached = await cacheGetText(path);
+        if (cached?.text) {
+          text = cached.text;
+          loadedFromCache += 1;
+        }
+      } catch {
+        // ignore cache errors; fallback to extract if allowed
+      }
+
+      if (!text && !uiLoadCacheOnly) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = window.setTimeout(
+            () => controller.abort(),
+            REQUEST_TIMEOUT_MS * 2
+          );
+          let response: Response;
+          try {
+            response = await fetch("/api/extract", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                filePath: path,
+                fileName: path.split("/").pop() ?? path,
+              }),
+              signal: controller.signal,
+            });
+          } finally {
+            window.clearTimeout(timeoutId);
+          }
+          const data = (await response.json()) as { text?: string };
+          if (response.ok && data.text) {
+            text = data.text;
+            extracted += 1;
+            try {
+              const clipped = text.slice(0, MAX_FILE_BYTES);
+              await cachePutText({
+                path,
+                text: clipped,
+                size: clipped.length,
+                storedAt: Date.now(),
+              });
+              text = clipped;
+            } catch {
+              // ignore cache put errors
+            }
+          }
+        } catch {
+          // ignore per-file extract errors
+        }
+      }
+
+      if (!text) {
+        missing += 1;
+        continue;
+      }
+
+      batch.push({ path, content: text, size: text.length });
+      loaded += 1;
+      if (batch.length >= BATCH_FLUSH) {
+        const toAdd = batch.splice(0, batch.length);
+        setFileContext((prev) => [...prev, ...toAdd]);
+      }
+    }
+
+    if (batch.length > 0) {
+      setFileContext((prev) => [...prev, ...batch]);
+    }
+    setLoadProgress(null);
+    setStatus(
+      `✓ Načteno do UI kontextu: ${loaded} (cache: ${loadedFromCache}, extract: ${extracted}, chybí: ${missing}). ` +
+        `Tip: pro 2300 souborů držte limit níž (např. 200–500).`
+    );
   };
 
   useEffect(() => {
@@ -1106,6 +2008,9 @@ export default function Home() {
         message?: string;
         chunksCount?: number;
         filesCount?: number;
+        skippedFiles?: Array<{ name: string; reason: string }>;
+        skippedEmptyChunks?: number;
+        embeddingDimension?: number;
         error?: string;
       };
       if (!response.ok) {
@@ -1113,8 +2018,18 @@ export default function Home() {
       }
       setIndexProgress({ label: "Hotovo", percent: 100 });
       setIsIndexed(true);
+      const skippedCount = data.skippedFiles?.length ?? 0;
+      const indexedFiles = Math.max(0, (data.filesCount ?? 0) - skippedCount);
+      const skippedSample = data.skippedFiles?.slice(0, 3).map((x) => x.name) ?? [];
+      const skippedSuffix = skippedCount
+        ? `; přeskočeno ${skippedCount}/${data.filesCount} souborů (např. ${skippedSample.join(", ")}${skippedCount > skippedSample.length ? ", …" : ""})`
+        : "";
+      const dimSuffix = data.embeddingDimension
+        ? `; dim=${data.embeddingDimension}`
+        : "";
+
       setStatus(
-        `✓ Indexed ${data.filesCount} files → ${data.chunksCount} chunks`
+        `✓ Indexed ${indexedFiles}/${data.filesCount} souborů → ${data.chunksCount} chunků${skippedSuffix}${dimSuffix}`
       );
     } catch (error) {
       setStatus(
@@ -1123,6 +2038,42 @@ export default function Home() {
     } finally {
       setIsIndexing(false);
       setTimeout(() => setIndexProgress(null), 800);
+    }
+  };
+
+  const handleRebuildIndex = async (mode: "drop" | "truncate") => {
+    if (isRebuilding) return;
+    if (typeof window !== "undefined") {
+      const promptMessage =
+        mode === "truncate"
+          ? "Opravdu chcete vycistit index? Tato akce smaze vsechny radky v file_index."
+          : "Opravdu chcete rebuildnout index? Tato akce smaze tabulku file_index a je nevratna.";
+      const confirmed = window.confirm(promptMessage);
+      if (!confirmed) return;
+    }
+    setIsRebuilding(true);
+    setStatus(mode === "truncate" ? "Cistim index..." : "Probíhá rebuild indexu...");
+    try {
+      const response = await fetch(`/api/index/rebuild?mode=${mode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = (await response.json()) as { success?: boolean; message?: string; error?: string };
+      if (!response.ok) {
+        throw new Error(data.error ?? "Rebuild failed.");
+      }
+      setIsIndexed(false);
+      setDbIndexStatus({ checked: true, hasAnyIndex: false, hasContextIndex: false });
+      setStatus(
+        data.message ??
+          (mode === "truncate"
+            ? "Index vycisten. Spustte novou indexaci."
+            : "Index smazan. Spustte novou indexaci.")
+      );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Rebuild failed.");
+    } finally {
+      setIsRebuilding(false);
     }
   };
 
@@ -1135,27 +2086,429 @@ export default function Home() {
     setStatus(null);
     setMessages((prev) => [...prev, { role: "user", text: trimmed }]);
     setChatInput("");
+    let didTimeout = false;
     try {
+      const asksWhatDataWeHave =
+        /(s\s*jak(ymi|ými)\s*daty|jak(a|á)\s*data|co\s*m(a|á)me\s*k\s*dispozici|co\s*je\s*v\s*kontextu)/i.test(
+          trimmed
+        );
+
+      if (asksWhatDataWeHave && fileContext.length === 0 && hasDbIndex) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text:
+              "UI kontext je teď prázdný (nemám v prohlížeči načtené texty souborů), ale data jsou zaindexovaná v databázi. " +
+              "Můžeme tedy pracovat přes vyhledávání nad DB (RAG) – ptejte se normálně na obsah datasetu. " +
+              "Pokud chcete lokální výpočty nad CSV (řádky, agregace po měsících apod.), použijte tlačítko „Načíst do UI kontextu“.",
+          },
+        ]);
+        return;
+      }
+
+      const wantsOrdersByYearMonth =
+        /(objednav|order)/i.test(trimmed) &&
+        /(rok|year)/i.test(trimmed) &&
+        /(mesic|měsíc|month)/i.test(trimmed);
+
+      if (wantsOrdersByYearMonth) {
+        if (fileContext.length === 0) {
+          if (!hasDbIndex) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                text:
+                  "Teď nemám načtený žádný obsah souborů v kontextu. Přidejte CSV soubory do Kontextu a pak spočítám objednávky po měsících.",
+              },
+            ]);
+            return;
+          }
+
+          setStatus("Počítám objednávky po měsících z databáze...");
+          const response = await fetch("/api/analytics/orders-by-month", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contextId: activeContext?.id ?? undefined,
+            }),
+          });
+          const data = (await response.json()) as {
+            byMonth?: Array<{ ym: string; count: number }>;
+            filesUsed?: number;
+            rowsUsed?: number;
+            rowsSkipped?: number;
+            usedUniqueOrderIds?: boolean;
+            notes?: string[];
+            error?: string;
+          };
+          if (!response.ok) {
+            throw new Error(data.error ?? "Orders analysis failed.");
+          }
+          const byMonth = data.byMonth ?? [];
+          if (byMonth.length === 0) {
+            const notes = data.notes?.length
+              ? `\n\nPoznámky:\n- ${data.notes.join("\n- ")}`
+              : "";
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                text:
+                  `Nepodařilo se spočítat objednávky po měsících z databáze. (Soubory použité ke čtení: ${data.filesUsed ?? 0}, řádků: ${data.rowsUsed ?? 0}, přeskočeno: ${data.rowsSkipped ?? 0})${notes}`,
+              },
+            ]);
+            return;
+          }
+
+          const header =
+            "| Rok | Měsíc | Počet objednávek |\n|---:|---:|---:|";
+          const rows = byMonth
+            .map(({ ym, count }) => {
+              const [y, m] = ym.split("-");
+              return `| ${y} | ${m} | ${count} |`;
+            })
+            .join("\n");
+          const notes = data.notes?.length
+            ? `\n\nPoznámky:\n- ${data.notes.join("\n- ")}`
+            : "";
+          const method = data.usedUniqueOrderIds
+            ? "unikátní orderId (deduplikace)"
+            : "počet řádků (bez deduplikace)";
+
+          // Create chart from all orders
+          const chartLabels = byMonth.map((item) => item.ym);
+          const chartSeries = byMonth.map((item) => item.count);
+          setAssistantCharts((prev) => [
+            ...prev,
+            {
+              id: `chart-${Date.now()}`,
+              title: "Objednávky po měsících (všechny soubory)",
+              type: "bar",
+              labels: chartLabels,
+              series: chartSeries,
+            },
+          ]);
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                `Počet objednávek za každý rok a měsíc (metoda: ${method}).\n` +
+                `Zpracováno: ${data.filesUsed ?? 0} CSV/TSV souborů; řádků: ${data.rowsUsed ?? 0}; přeskočeno: ${data.rowsSkipped ?? 0}.\n\n` +
+                `${header}\n${rows}${notes}`,
+            },
+          ]);
+          return;
+        }
+
+        setStatus(`Počítám objednávky po měsících z ${fileContext.length} souborů...`);
+        const result = await computeOrdersByYearMonth(fileContext);
+        if (result.byMonth.length === 0) {
+          const notes = result.notes.length ? `\n\nPoznámky:\n- ${result.notes.join("\n- ")}` : "";
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                `Nepodařilo se spočítat objednávky po měsících z načteného kontextu. (Soubory použité ke čtení: ${result.filesUsed}, řádků: ${result.rowsUsed}, přeskočeno: ${result.rowsSkipped})${notes}`,
+            },
+          ]);
+          return;
+        }
+
+        const header =
+          "| Rok | Měsíc | Počet objednávek |\n|---:|---:|---:|";
+        const rows = result.byMonth
+          .map(({ ym, count }) => {
+            const [y, m] = ym.split("-");
+            return `| ${y} | ${m} | ${count} |`;
+          })
+          .join("\n");
+        const notes = result.notes.length ? `\n\nPoznámky:\n- ${result.notes.join("\n- ")}` : "";
+        const method = result.usedUniqueOrderIds
+          ? "unikátní orderId (deduplikace)"
+          : "počet řádků (bez deduplikace)";
+
+        // Create chart from local context
+        const chartLabels = result.byMonth.map((item) => item.ym);
+        const chartSeries = result.byMonth.map((item) => item.count);
+        setAssistantCharts((prev) => [
+          ...prev,
+          {
+            id: `chart-${Date.now()}`,
+            title: "Objednávky po měsících (načtený kontext)",
+            type: "bar",
+            labels: chartLabels,
+            series: chartSeries,
+          },
+        ]);
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text:
+              `Počet objednávek za každý rok a měsíc (metoda: ${method}).\n` +
+              `Zpracováno: ${result.filesUsed} CSV/TSV souborů; řádků: ${result.rowsUsed}; přeskočeno: ${result.rowsSkipped}.\n\n` +
+              `${header}\n${rows}${notes}`,
+          },
+        ]);
+        return;
+      }
+
+      // Handler for orders by state
+      const wantsOrdersByState =
+        /(objednav|order)/i.test(trimmed) &&
+        /(stat|state|country|zem)/i.test(trimmed);
+
+      if (wantsOrdersByState) {
+        if (fileContext.length === 0 && !hasDbIndex) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                "Teď nemám načtený žádný obsah souborů v kontextu a data nejsou v databázi. Přidejte CSV soubory do Kontextu nebo synchronizujte Samba kontext.",
+            },
+          ]);
+          return;
+        }
+
+        if (fileContext.length === 0 && hasDbIndex) {
+          setStatus("Počítám objednávky po státech z databáze...");
+          const response = await fetch("/api/analytics/orders-by-state", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contextId: activeContext?.id ?? undefined,
+            }),
+          });
+          const data = (await response.json()) as {
+            byState?: Array<{ state: string; count: number }>;
+            filesUsed?: number;
+            rowsUsed?: number;
+            rowsSkipped?: number;
+            usedUniqueOrderIds?: boolean;
+            notes?: string[];
+            error?: string;
+          };
+          if (!response.ok) {
+            throw new Error(data.error ?? "Orders by state analysis failed.");
+          }
+          const byState = data.byState ?? [];
+          if (byState.length === 0) {
+            const notes = data.notes?.length
+              ? `\n\nPoznámky:\n- ${data.notes.join("\n- ")}`
+              : "";
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                text:
+                  `Nepodařilo se spočítat objednávky po státech z databáze. (Soubory použité ke čtení: ${data.filesUsed ?? 0}, řádků: ${data.rowsUsed ?? 0}, přeskočeno: ${data.rowsSkipped ?? 0})${notes}`,
+              },
+            ]);
+            return;
+          }
+
+          const header = "| Stát | Počet objednávek |\n|:---|---:|";
+          const rows = byState
+            .map(({ state, count }) => `| ${state} | ${count} |`)
+            .join("\n");
+          const notes = data.notes?.length
+            ? `\n\nPoznámky:\n- ${data.notes.join("\n- ")}`
+            : "";
+          const method = data.usedUniqueOrderIds
+            ? "unikátní orderId (deduplikace)"
+            : "počet řádků (bez deduplikace)";
+
+          // Create chart from all states
+          const chartLabels = byState.map((item) => item.state);
+          const chartSeries = byState.map((item) => item.count);
+          setAssistantCharts((prev) => [
+            ...prev,
+            {
+              id: `chart-${Date.now()}`,
+              title: "Objednávky po státech (všechny soubory)",
+              type: "bar",
+              labels: chartLabels,
+              series: chartSeries,
+            },
+          ]);
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                `Počet objednávek za každý stát (metoda: ${method}).\n` +
+                `Zpracováno: ${data.filesUsed ?? 0} CSV/TSV souborů; řádků: ${data.rowsUsed ?? 0}; přeskočeno: ${data.rowsSkipped ?? 0}.\n\n` +
+                `${header}\n${rows}${notes}`,
+            },
+          ]);
+          return;
+        }
+
+        // If we have file context, inform user to use DB for full analysis
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text:
+              "Pro analýzu objednávek po státech z lokálního kontextu ještě není implementováno. Použijte synchronizovaný kontext v databázi pro analýzu všech souborů.",
+          },
+        ]);
+        return;
+      }
+
+      // Local utility: counting string occurrences across currently loaded file contents.
+      // This avoids model hallucinations and works even when context is truncated.
+      const isCountRequest =
+        /\bkolik\b/i.test(trimmed) &&
+        /soubor/i.test(trimmed);
+      if (isCountRequest) {
+        const wantsLineCountsPerFile =
+          /(radk|řádk)/i.test(trimmed) &&
+          /(kazd|každ)/i.test(trimmed);
+
+        if (wantsLineCountsPerFile) {
+          if (fileContext.length === 0) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                text:
+                  "Teď nemám načtený žádný obsah souborů v kontextu. Přidejte soubory do Kontextu a pak spočítám řádky.",
+              },
+            ]);
+            return;
+          }
+
+          setStatus(`Počítám řádky ve ${fileContext.length} souborech...`);
+          const stats: Array<{ path: string; count: number }> = [];
+          let total = 0;
+          for (let i = 0; i < fileContext.length; i += 1) {
+            const f = fileContext[i];
+            const lines = countLinesFast(f.content);
+            total += lines;
+            stats.push({ path: f.path, count: lines });
+            if ((i + 1) % 50 === 0) {
+              // Yield to keep the UI responsive for large contexts.
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+          }
+
+          stats.sort((a, b) => b.count - a.count);
+          const top = stats.slice(0, 20);
+          const topLines = top.map((x) => `- ${x.path}: ${x.count}`).join("\n");
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                `Počet řádků podle souboru (načtený kontext: ${fileContext.length} souborů).\n` +
+                `Celkem řádků: ${total}.\n\n` +
+                `Top soubory podle počtu řádků:\n${topLines}`,
+            },
+          ]);
+          return;
+        }
+
+        const needle = extractCountNeedle(trimmed);
+        if (!needle) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                "Napište prosím přesně, co mám počítat (např. kolik je ve všech souborech \"orderid\").",
+            },
+          ]);
+          return;
+        }
+        if (fileContext.length === 0) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                "Teď nemám načtený žádný obsah souborů v kontextu. Přidejte soubory do Kontextu a pak to spočítám.",
+            },
+          ]);
+          return;
+        }
+
+        const looksLikeCsvCount = /sloupc|column/i.test(trimmed);
+        const needleLower = needle.toLowerCase();
+        const hits = fileContext
+          .map((f) => {
+            const contentLower = f.content.toLowerCase();
+            const likelyCsv =
+              /\.(csv|tsv)(\s|$)/i.test(f.path) ||
+              /\n/.test(f.content) && (f.content.includes(",") || f.content.includes(";") || f.content.includes("\t"));
+            if (looksLikeCsvCount && likelyCsv) {
+              return {
+                path: f.path,
+                count: countCsvColumnValues(f.content, needleLower),
+                mode: "csv_column" as const,
+              };
+            }
+            return {
+              path: f.path,
+              count: countOccurrences(contentLower, needleLower),
+              mode: "substring" as const,
+            };
+          })
+          .filter((x) => x.count > 0)
+          .sort((a, b) => b.count - a.count);
+        const total = hits.reduce((sum, x) => sum + x.count, 0);
+
+        const top = hits.slice(0, 10);
+        const topLines = top.length
+          ? top.map((x) => `- ${x.path}: ${x.count}`).join("\n")
+          : "(nenalezeno v žádném načteném souboru)";
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text:
+              looksLikeCsvCount
+                ? `V načteném kontextu jsem napočítal celkem ${total} hodnot ve sloupci "${needle}" napříč ${hits.length} soubory (z ${fileContext.length} načtených).\n\nTop soubory:\n${topLines}`
+                : `V načteném kontextu jsem našel celkem ${total} výskytů řetězce "${needle}" ve ${hits.length} souborech (z ${fileContext.length} načtených).\n\nTop soubory:\n${topLines}`,
+          },
+        ]);
+        return;
+      }
+
       const controller = new AbortController();
-      const timeoutId = setTimeout(
-        () => controller.abort(),
-        REQUEST_TIMEOUT_MS
-      );
+      const timeoutId = window.setTimeout(() => {
+        didTimeout = true;
+        controller.abort();
+      }, CHAT_REQUEST_TIMEOUT_MS);
 
       // Use indexed search if available, otherwise fall back to direct gemini
-      const endpoint = isIndexed ? "/api/search" : "/api/gemini";
+      const endpoint = hasDbIndex ? "/api/search" : "/api/gemini";
       const body =
-        isIndexed
+        hasDbIndex
           ? JSON.stringify({ query: trimmed })
           : JSON.stringify({ message: trimmed, context: contextText });
 
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
+      let response: Response;
+      try {
+        response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
       const data = (await response.json()) as { text?: string; error?: string };
       if (!response.ok) {
         throw new Error(data.error ?? "Request failed.");
@@ -1164,7 +2517,7 @@ export default function Home() {
       if (chart) {
         setAssistantCharts((prev) => [
           ...prev,
-          { ...chart, id: crypto.randomUUID() },
+          { ...chart, id: generateUUID() },
         ]);
       }
       setMessages((prev) => [
@@ -1177,9 +2530,13 @@ export default function Home() {
         {
           role: "assistant",
           text:
-            error instanceof Error
-              ? error.message
-              : "Request failed.",
+            error instanceof DOMException && error.name === "AbortError"
+              ? didTimeout
+                ? `Požadavek vypršel po ${Math.round(CHAT_REQUEST_TIMEOUT_MS / 1000)} s (timeout). Zkuste to prosím znovu; případně nejdřív zmenšete dotaz nebo přidejte méně souborů do kontextu.`
+                : "Požadavek byl zrušen (abort)."
+              : error instanceof Error
+                ? error.message
+                : "Request failed.",
         },
       ]);
     } finally {
@@ -1305,7 +2662,9 @@ export default function Home() {
                 <select
                   className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
                   value={activeContextId ?? ""}
-                  onChange={(event) => setActiveContextId(event.target.value)}
+                  onChange={(event) =>
+                    setActiveContextId(event.target.value || null)
+                  }
                 >
                   {savedContexts.map((ctx) => (
                     <option key={ctx.id} value={ctx.id}>
@@ -1325,9 +2684,11 @@ export default function Home() {
                 />
                 <button
                   className="rounded-2xl border border-slate-700 px-4 py-2 text-sm"
+                  type="button"
                   onClick={handleSyncActiveContext}
+                  disabled={!activeContext || isSyncing}
                 >
-                  Sync now
+                  {isSyncing ? "Syncing..." : "Sync now"}
                 </button>
               </div>
             ) : (
@@ -1404,6 +2765,47 @@ export default function Home() {
                 >
                   Smazat
                 </button>
+                <div className="flex flex-wrap items-center gap-2 justify-end">
+                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                    <span>Load limit</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={5000}
+                      className="w-24 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
+                      value={uiLoadLimit}
+                      onChange={(e) =>
+                        setUiLoadLimit(Math.max(1, Number(e.target.value) || 1))
+                      }
+                    />
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={uiLoadCacheOnly}
+                      onChange={(e) => setUiLoadCacheOnly(e.target.checked)}
+                    />
+                    Jen z cache
+                  </label>
+                  <button
+                    className="rounded-2xl border border-slate-700 px-3 py-2 text-xs"
+                    type="button"
+                    onClick={handleSaveUiContextToActiveContext}
+                    disabled={!activeContext}
+                    title="Uloží seznam aktuálních souborů v UI kontextu do vybraného uloženého kontextu (jen cesty)."
+                  >
+                    Uložit UI kontext
+                  </button>
+                  <button
+                    className="rounded-2xl border border-slate-700 px-3 py-2 text-xs"
+                    type="button"
+                    onClick={handleLoadUiContextFromActiveContext}
+                    disabled={!activeContext}
+                    title="Načte soubory do UI kontextu. Primárně z IndexedDB cache; volitelně umí doextrahovat chybějící."
+                  >
+                    Načíst do UI kontextu
+                  </button>
+                </div>
                 <div className="text-xs text-slate-500">
                   {activeContext.lastIndexedAt
                     ? `Naposledy: ${new Date(
@@ -1644,13 +3046,29 @@ export default function Home() {
                     : "bg-amber-500 text-slate-900"
                 } disabled:opacity-60`}
                 onClick={handleIndexFiles}
-                disabled={fileContext.length === 0 || isIndexing}
+                disabled={fileContext.length === 0 || isIndexing || isRebuilding}
               >
                 {isIndexing
                   ? "Indexování..."
                   : isIndexed
                     ? "✓ Indexováno"
                     : "Indexovat soubory do databáze "}
+              </button>
+              <button
+                className="rounded-2xl border border-amber-500/60 px-4 py-2 text-sm font-semibold text-amber-200 hover:bg-amber-500/10 disabled:opacity-60"
+                onClick={() => handleRebuildIndex("truncate")}
+                disabled={isIndexing || isRebuilding}
+                title="Vymaze obsah tabulky file_index bez zmeny schematu"
+              >
+                {isRebuilding ? "Cistim..." : "Vymazat index"}
+              </button>
+              <button
+                className="rounded-2xl border border-rose-500/60 px-4 py-2 text-sm font-semibold text-rose-200 hover:bg-rose-500/10 disabled:opacity-60"
+                onClick={() => handleRebuildIndex("drop")}
+                disabled={isIndexing || isRebuilding}
+                title="Smaze tabulku file_index a bude nutne znovu indexovat"
+              >
+                {isRebuilding ? "Rebuild..." : "Rebuild index"}
               </button>
               <button
                 className="rounded-2xl border border-slate-700 px-4 py-2 text-sm"
@@ -1662,6 +3080,38 @@ export default function Home() {
               >
                 Vymazat kontext
               </button>
+
+              {knowledgeBase?.initialized && (
+                <div className="rounded-2xl border border-slate-700 bg-slate-900/50 p-4">
+                  <h3 className="text-sm font-semibold text-slate-200">
+                    Knowledge Base
+                  </h3>
+                  <div className="mt-2 space-y-1 text-xs text-slate-400">
+                    <p>
+                      <span className="font-medium">Soubory:</span>{" "}
+                      {knowledgeBase.totalFiles}
+                    </p>
+                    <p>
+                      <span className="font-medium">Chunks:</span>{" "}
+                      {knowledgeBase.totalChunks}
+                    </p>
+                    <p>
+                      <span className="font-medium">Dimenze:</span>{" "}
+                      {knowledgeBase.embeddingDimension}D
+                    </p>
+                    {knowledgeBase.lastIndexedAt && (
+                      <p>
+                        <span className="font-medium">Poslední indexace:</span>{" "}
+                        {new Date(knowledgeBase.lastIndexedAt).toLocaleString()}
+                      </p>
+                    )}
+                    {knowledgeBase.readyForSearch && (
+                      <p className="text-emerald-400 font-medium">Pripraveno k vyhledavani</p>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
                 <h3 className="text-sm font-semibold text-slate-200">
                   Kontext ({fileContext.length})
@@ -1669,11 +3119,24 @@ export default function Home() {
                 <p className="mt-1 text-xs text-slate-400">
                   {contextText.length} / {MAX_CONTEXT_CHARS} chars
                 </p>
+                <div className="mt-3">
+                  <input
+                    className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500"
+                    placeholder="Filtrovat kontext podle cesty (např. export-2019-10)"
+                    value={contextFilter}
+                    onChange={(e) => setContextFilter(e.target.value)}
+                  />
+                  {filteredContext.length !== fileContext.length && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Filtrováno: {filteredContext.length} / {fileContext.length}
+                    </p>
+                  )}
+                </div>
                 <div className="mt-3 max-h-56 space-y-2 overflow-auto text-xs">
                   {fileContext.length === 0 && (
                     <p className="text-slate-500">Žádné soubory v kontextu.</p>
                   )}
-                  {fileContext.map((item) => (
+                  {displayedContext.map((item) => (
                     <div
                       key={item.path}
                       className="flex items-center justify-between gap-2 rounded-xl border border-slate-800 bg-slate-900/40 px-3 py-2"
@@ -1687,6 +3150,11 @@ export default function Home() {
                       </button>
                     </div>
                   ))}
+                  {filteredContext.length > displayedContext.length && (
+                    <p className="text-slate-500">
+                      ... showing first {displayedContext.length} of {filteredContext.length}
+                    </p>
+                  )}
                 </div>
               </div>
             </div>
@@ -1716,6 +3184,7 @@ export default function Home() {
               >
                 <option value="pie">Koláčový</option>
                 <option value="bar">Sloupcový</option>
+                <option value="line">Liniový</option>
               </select>
             </div>
           </div>
