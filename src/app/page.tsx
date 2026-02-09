@@ -447,6 +447,15 @@ type OrdersByMonthResult = {
   notes: string[];
 };
 
+type OrdersByStateResult = {
+  byState: Array<{ state: string; count: number }>;
+  filesUsed: number;
+  rowsUsed: number;
+  rowsSkipped: number;
+  usedUniqueOrderIds: boolean;
+  notes: string[];
+};
+
 async function computeOrdersByYearMonth(
   fileContext: FileContext[],
   signal?: AbortSignal
@@ -569,6 +578,134 @@ async function computeOrdersByYearMonth(
 
   return {
     byMonth,
+    filesUsed,
+    rowsUsed,
+    rowsSkipped,
+    usedUniqueOrderIds,
+    notes,
+  };
+}
+
+async function computeOrdersByState(
+  fileContext: FileContext[],
+  signal?: AbortSignal
+): Promise<OrdersByStateResult> {
+  const orderIdCandidates = [
+    "orderid",
+    "order_id",
+    "ordernumber",
+    "order_number",
+    "objednavkaid",
+    "objednavka_id",
+    "idobjednavky",
+  ];
+  const stateCandidates = [
+    "country",
+    "state",
+    "stat",
+    "zeme",
+    "země",
+    "land",
+    "shipping_country",
+    "billing_country",
+  ];
+
+  const notes: string[] = [];
+  const countByState = new Map<string, number>();
+  const setsByState = new Map<string, Set<string>>();
+  const MAX_UNIQUE_PER_STATE = 200_000;
+  let usedUniqueOrderIds = true;
+  let filesUsed = 0;
+  let rowsUsed = 0;
+  let rowsSkipped = 0;
+
+  for (let fi = 0; fi < fileContext.length; fi += 1) {
+    if (signal?.aborted) {
+      notes.push("Výpočet byl zrušen (abort).");
+      break;
+    }
+    const f = fileContext[fi];
+    const isLikelyCsv = /\.(csv|tsv)(\s|$)/i.test(f.path) || looksLikeDelimitedText(f.content);
+    if (!isLikelyCsv) continue;
+
+    const lines = f.content
+      .replace(/\r\n?/g, "\n")
+      .split("\n")
+      .filter((l) => l.trim().length > 0);
+    if (lines.length < 2) continue;
+
+    const delimiter = detectCsvDelimiter(lines[0]);
+    const headerFields = parseCsvLine(lines[0], delimiter).map((x) => x.trim());
+    if (headerFields.length < 2) continue;
+
+    const orderIdx = findHeaderIndex(headerFields, orderIdCandidates);
+    const stateIdx = findHeaderIndex(headerFields, stateCandidates);
+    if (stateIdx < 0) continue;
+
+    filesUsed += 1;
+
+    for (let li = 1; li < lines.length; li += 1) {
+      const row = parseCsvLine(lines[li], delimiter);
+      const stateVal = (row[stateIdx] ?? "").trim();
+      if (!stateVal) {
+        rowsSkipped += 1;
+        continue;
+      }
+
+      if (orderIdx >= 0 && usedUniqueOrderIds) {
+        const orderId = (row[orderIdx] ?? "").trim();
+        if (!orderId) {
+          rowsSkipped += 1;
+          continue;
+        }
+        let s = setsByState.get(stateVal);
+        if (!s) {
+          s = new Set<string>();
+          setsByState.set(stateVal, s);
+        }
+        s.add(orderId);
+        // Safety valve for very large datasets
+        if (s.size > MAX_UNIQUE_PER_STATE) {
+          usedUniqueOrderIds = false;
+          notes.push(
+            `Stát ${stateVal} překročil ${MAX_UNIQUE_PER_STATE} unikátních orderId; přepínám na počítání řádků (bez deduplikace).`
+          );
+          setsByState.clear();
+        }
+      } else {
+        countByState.set(stateVal, (countByState.get(stateVal) ?? 0) + 1);
+      }
+      rowsUsed += 1;
+    }
+
+    if (fi % 25 === 0) {
+      // Yield to keep UI responsive
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  if (usedUniqueOrderIds) {
+    for (const [state, set] of setsByState.entries()) {
+      countByState.set(state, set.size);
+    }
+  }
+
+  const byState = Array.from(countByState.entries())
+    .map(([state, count]) => ({ state, count }))
+    .sort((a, b) => b.count - a.count); // Sort by count descending
+
+  if (filesUsed === 0) {
+    notes.push(
+      "Nenašel jsem v kontextu CSV/TSV se sloupcem pro stát/zemi. Zkontrolujte, že CSV obsahují hlavičku a sloupec country/state/stat."
+    );
+  } else if (byState.length === 0) {
+    notes.push(
+      "Našel jsem sice soubory, ale nepodařilo se z nich vyparsovat žádné platné hodnoty státu/země."
+    );
+  }
+
+  return {
+    byState,
     filesUsed,
     rowsUsed,
     rowsSkipped,
@@ -2820,13 +2957,53 @@ export default function Home() {
           return;
         }
 
-        // If we have file context, inform user to use DB for full analysis
+        // Analyze from local file context
+        setStatus(`Počítám objednávky po státech z ${fileContext.length} souborů...`);
+        const result = await computeOrdersByState(fileContext);
+        if (result.byState.length === 0) {
+          const notes = result.notes.length ? `\n\nPoznámky:\n- ${result.notes.join("\n- ")}` : "";
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                `Nepodařilo se spočítat objednávky po státech z načteného kontextu. (Soubory použité ke čtení: ${result.filesUsed}, řádků: ${result.rowsUsed}, přeskočeno: ${result.rowsSkipped})${notes}`,
+            },
+          ]);
+          return;
+        }
+
+        const header = "| Stát | Počet objednávek |\n|:---|---:|";
+        const rows = result.byState
+          .map(({ state, count }) => `| ${state} | ${count} |`)
+          .join("\n");
+        const notes = result.notes.length ? `\n\nPoznámky:\n- ${result.notes.join("\n- ")}` : "";
+        const method = result.usedUniqueOrderIds
+          ? "unikátní orderId (deduplikace)"
+          : "počet řádků (bez deduplikace)";
+
+        // Create chart from local context
+        const chartLabels = result.byState.map((item) => item.state);
+        const chartSeries = result.byState.map((item) => item.count);
+        setAssistantCharts((prev) => [
+          ...prev,
+          {
+            id: `chart-${Date.now()}`,
+            title: "Objednávky po státech (načtený kontext)",
+            type: "bar",
+            labels: chartLabels,
+            series: chartSeries,
+          },
+        ]);
+
         setMessages((prev) => [
           ...prev,
           {
             role: "assistant",
             text:
-              "Pro analýzu objednávek po státech z lokálního kontextu ještě není implementováno. Použijte synchronizovaný kontext v databázi pro analýzu všech souborů.",
+              `Počet objednávek za každý stát (metoda: ${method}).\n` +
+              `Zpracováno: ${result.filesUsed} CSV/TSV souborů; řádků: ${result.rowsUsed}; přeskočeno: ${result.rowsSkipped}.\n\n` +
+              `${header}\n${rows}${notes}`,
           },
         ]);
         return;
