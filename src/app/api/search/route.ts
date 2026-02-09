@@ -211,6 +211,15 @@ export async function POST(request: Request) {
       )) as Array<{ pageContent: string; metadata: { source: string; [key: string]: any } }>;
     }
 
+    const contextPrefix = payload.contextId ? `${payload.contextId}:` : null;
+    if (contextPrefix) {
+      results = results.filter(
+        (row) =>
+          typeof row.metadata?.source === "string" &&
+          row.metadata.source.startsWith(contextPrefix)
+      );
+    }
+
     const allSources = Array.from(new Set(results.map((r) => r.metadata.source)));
     
     // Pokud analyzeOnly=true, vrať jen statistiky bez volání Gemini
@@ -238,13 +247,28 @@ export async function POST(request: Request) {
     const model = genAI.getGenerativeModel({ model: modelName });
 
     const chartInstruction = `\n\nIf the user asks to show, visualize, chart or graph data, extract the numbers from the documents and return a chart block using EXACTLY this format at the end:\n[[CHART]]\n{"title":"<short title>","type":"pie|bar|line","labels":["A","B"],"series":[10,20]}\n[[/CHART]]\nOnly include the chart block if you have reliable numbers. Keep the rest of the answer in Czech.`;
+    const wantsStructured = /(strukturov|structured|prehled|přehled)/i.test(
+      payload.query
+    );
+    const wantsFullContextTab = /(zalozk|zalozku|cely\s+kontext|celý\s+kontext)/i.test(
+      payload.query
+    );
+    const structuredInstruction = wantsStructured
+      ? `\n\nThe user explicitly wants structured results. You MUST include a structured results block at the end using EXACTLY this format (even if you already wrote prose):\n[[STRUCTURED]]\n{"groups":[{"client":"CategoryName","files":[{"path":"path/to/file.xlsx","description":"Brief description"}]}],"summary":"Brief summary"}\n[[/STRUCTURED]]\nGroup files into sensible categories based on the documents. In the files array, include relevant file paths from the Documents. If no files are found, return an empty groups array and explain in the summary. Keep descriptions brief and in Czech.`
+      : `\n\nIf the user asks about finding files for specific clients or entities (e.g., "mám klienta colonnade a helvetia"), organize your response to include a structured results block at the end using EXACTLY this format:\n[[STRUCTURED]]\n{"groups":[{"client":"ClientName","files":[{"path":"path/to/file.xlsx","description":"Brief description"}]}],"summary":"Brief summary"}\n[[/STRUCTURED]]\nIn the files array, include all relevant file paths from the Documents that belong to each client. Keep descriptions brief and in Czech.`;
+    const fullContextInstruction = wantsFullContextTab
+      ? `\n\nThe user explicitly asked for a full-context tab. In the structured results, add a group with client "Cely kontext" that lists ONLY the file paths from the Sources list below. Do not add any other paths. Use brief Czech descriptions like "Soubor z kontextu".`
+      : "";
     const accessInstruction = `\n\nYou have access ONLY to the provided Documents text. Never say things like "Nemám přístup k obsahu souborů" or "nemohu spočítat" because you can access the provided Documents. If the Documents do not contain the needed information, say in Czech that the provided documents are insufficient and ask the user to add the relevant files to context.`;
     
     const contextInfo = results.length > maxChunks 
       ? `\n\nIMPORTANT: You are analyzing ${limitedResults.length} chunks out of ${results.length} total chunks from ${allSources.length} files. The analysis is based on a representative sample.`
       : `\n\nYou are analyzing ${results.length} chunks from ${allSources.length} files.`;
 
-    const prompt = `Based on the following documents, answer the query:${contextInfo}\n\nDocuments:\n${context}\n\nQuery: ${payload.query}${chartInstruction}${accessInstruction}`;
+    const sourcesList = allSources.length
+      ? `\n\nSources:\n${allSources.map((source) => `- ${source}`).join("\n")}`
+      : "\n\nSources:\n(none)";
+    const prompt = `Based on the following documents, answer the query:${contextInfo}${sourcesList}\n\nDocuments:\n${context}\n\nQuery: ${payload.query}${chartInstruction}${structuredInstruction}${fullContextInstruction}${accessInstruction}`;
     const response = await model.generateContent(prompt);
     const text = response.response.text();
 

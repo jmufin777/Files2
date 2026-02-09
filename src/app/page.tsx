@@ -41,6 +41,42 @@ type ChatMessage = {
   text: string;
 };
 
+type SpeechRecognitionResultLike = {
+  0?: { transcript?: string };
+  isFinal?: boolean;
+};
+
+type SpeechRecognitionEventLike = {
+  results: SpeechRecognitionResultLike[];
+};
+
+type SpeechRecognitionInstance = {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type FileGroup = {
+  client: string;
+  files: Array<{
+    path: string;
+    description?: string;
+    size?: number;
+  }>;
+};
+
+type StructuredResult = {
+  groups: FileGroup[];
+  summary?: string;
+};
+
+type ActiveTab = "chat" | "results";
+
 type ChartType = "pie" | "bar" | "line";
 type ChartSource = "results" | "samba";
 type AssistantChart = {
@@ -92,6 +128,7 @@ const SKIP_DIRS = new Set(["node_modules", ".git", ".next", "dist", "build"]);
 const DEFAULT_OCR_MAX_PAGES = 5;
 const OCR_BATCH_SIZE = 5;
 const CONTEXTS_STORAGE_KEY = "nai.savedContexts.v1";
+const FILTERS_STORAGE_KEY = "nai.filters.v1";
 
 type CachedTextRecord = {
   path: string;
@@ -168,6 +205,49 @@ function generateUUID(): string {
     );
   }
   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * Remove diacritics and normalize for fuzzy Czech matching.
+ * "Příloha" → "priloha", "č.j." → "c.j."
+ */
+function normalizeCzech(str: string): string {
+  return str
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+/**
+ * Parse comma-separated search terms.
+ * Prefix ! means exclude.  Returns { include, exclude } arrays (normalized).
+ * Example: "docx, smlouva, !eon" →
+ *   include: ["docx", "smlouva"], exclude: ["eon"]
+ */
+function parseSearchTerms(input: string): { include: string[]; exclude: string[] } {
+  const include: string[] = [];
+  const exclude: string[] = [];
+  for (const raw of input.split(",")) {
+    const t = raw.trim();
+    if (!t) continue;
+    if (t.startsWith("!")) {
+      const val = normalizeCzech(t.slice(1).trim());
+      if (val) exclude.push(val);
+    } else {
+      include.push(normalizeCzech(t));
+    }
+  }
+  return { include, exclude };
+}
+
+/**
+ * Check if `text` fuzzy-contains `term` (both should be pre-normalized).
+ * Also tries with/without dot prefix for extensions.
+ */
+function fuzzyContains(text: string, term: string): boolean {
+  if (text.includes(term)) return true;
+  if (text.includes(`.${term}`)) return true;
+  return false;
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -852,10 +932,36 @@ function extractChartBlock(text: string): {
   return { cleanText, chart };
 }
 
+function extractStructuredBlock(text: string): {
+  cleanText: string;
+  structured: StructuredResult | null;
+} {
+  const blockRegex = /\[\[STRUCTURED\]\]([\s\S]*?)\[\[\/STRUCTURED\]\]/i;
+  const match = text.match(blockRegex);
+  if (!match) {
+    return { cleanText: text, structured: null };
+  }
+
+  const raw = match[1].trim();
+  let structured: StructuredResult | null = null;
+  try {
+    const parsed = JSON.parse(raw) as StructuredResult;
+    if (parsed && Array.isArray(parsed.groups)) {
+      structured = parsed;
+    }
+  } catch {
+    structured = null;
+  }
+
+  const cleanText = text.replace(blockRegex, "").trim();
+  return { cleanText, structured };
+}
+
 export default function Home() {
   const [directoryName, setDirectoryName] = useState<string | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [query, setQuery] = useState("");
+  const [contentQuery, setContentQuery] = useState("");
   const [results, setResults] = useState<FileEntry[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [fileContext, setFileContext] = useState<FileContext[]>([]);
@@ -865,6 +971,8 @@ export default function Home() {
   const [isSearching, setIsSearching] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [structuredResult, setStructuredResult] = useState<StructuredResult | null>(null);
+  const [activeTab, setActiveTab] = useState<ActiveTab>("chat");
   const [isSending, setIsSending] = useState(false);
   const [isIndexing, setIsIndexing] = useState(false);
   const [isRebuilding, setIsRebuilding] = useState(false);
@@ -874,11 +982,23 @@ export default function Home() {
   const [sambaFiles, setSambaFiles] = useState<SambaEntry[]>([]);
   const [isSambaScanning, setIsSambaScanning] = useState(false);
   const [sambaStats, setSambaStats] = useState<SambaStats | null>(null);
+  const [sambaSuggestedPaths, setSambaSuggestedPaths] = useState<Array<{ path: string; name: string }>>([]);
   const [autoAddSamba, setAutoAddSamba] = useState(false);
   const [autoAddLimit, setAutoAddLimit] = useState(0);
   const [sambaFilter, setSambaFilter] = useState("");
+  const [sambaContentFilter, setSambaContentFilter] = useState("");
+  const [isSambaFiltering, setIsSambaFiltering] = useState(false);
+  const [sambaMaxDays, setSambaMaxDays] = useState(0);
+  const [folderMaxDays, setFolderMaxDays] = useState(0);
+  const [lastScannedSambaPath, setLastScannedSambaPath] = useState("");
   const searchAbortRef = useRef<AbortController | null>(null);
+  const sambaCancelRef = useRef<AbortController | null>(null);
   const directoryInputRef = useRef<HTMLInputElement | null>(null);
+  const voiceRecogRef = useRef<SpeechRecognitionInstance | null>(null);
+  const [voiceSupported, setVoiceSupported] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const voiceBaseInputRef = useRef("");
+  const voiceFinalRef = useRef("");
   const [chartType, setChartType] = useState<ChartType>("pie");
   const [chartSource, setChartSource] = useState<ChartSource>("results");
   const [assistantCharts, setAssistantCharts] = useState<AssistantChartItem[]>(
@@ -913,6 +1033,8 @@ export default function Home() {
     readyForSearch: boolean;
   } | null>(null);
 
+
+
   const contextText = useMemo(() => buildContext(fileContext), [fileContext]);
 
   const filteredContext = useMemo(() => {
@@ -926,6 +1048,117 @@ export default function Home() {
     () => filteredContext.slice(0, CONTEXT_DISPLAY_LIMIT),
     [filteredContext]
   );
+
+  // Simple voice-to-text initialization
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const SpeechRecognitionCtor =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognitionCtor) {
+      setVoiceSupported(false);
+      return;
+    }
+
+    setVoiceSupported(true);
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = "cs-CZ";
+    recognition.continuous = false;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => {
+      setIsRecording(true);
+    };
+
+    recognition.onresult = (event: SpeechRecognitionEventLike) => {
+      let finalText = "";
+      let interimText = "";
+      for (let i = 0; i < event.results.length; i += 1) {
+        const result = event.results[i];
+        if (!result) continue;
+        const chunk = result[0]?.transcript ?? "";
+        if (!chunk) continue;
+        if (result.isFinal) {
+          finalText = finalText ? `${finalText} ${chunk}` : chunk;
+        } else {
+          interimText = interimText ? `${interimText} ${chunk}` : chunk;
+        }
+      }
+
+      voiceFinalRef.current = finalText.trim();
+      const combined = [
+        voiceBaseInputRef.current,
+        voiceFinalRef.current,
+        interimText.trim(),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (combined) {
+        setChatInput(combined);
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      setIsRecording(false);
+      const errorMsg = event?.error ?? "Neznámá chyba";
+      const pretty =
+        errorMsg === "not-allowed"
+          ? "Povolte mikrofon v prohlížeči."
+          : errorMsg === "no-speech"
+            ? "Neslyším žádný hlas."
+            : `Chyba hlasu: ${errorMsg}`;
+      setStatus(pretty);
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+      const combined = [voiceBaseInputRef.current, voiceFinalRef.current]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (combined) {
+        setChatInput(combined);
+      }
+    };
+
+    voiceRecogRef.current = recognition;
+    return () => {
+      try { recognition.stop(); } catch { /* ignore */ }
+      voiceRecogRef.current = null;
+    };
+  }, []);
+
+  const startVoiceInput = () => {
+    if (typeof window === "undefined") return;
+    if (!voiceSupported || !voiceRecogRef.current) {
+      setStatus("Rozpoznání hlasu není v tomto prohlížeči dostupné.");
+      return;
+    }
+    if (!window.isSecureContext) {
+      setStatus("Hlasové diktování vyžaduje HTTPS nebo localhost.");
+      return;
+    }
+    voiceBaseInputRef.current = chatInput.trim();
+    voiceFinalRef.current = "";
+    try {
+      voiceRecogRef.current.start();
+    } catch (e) {
+      setIsRecording(false);
+      setStatus(`Chyba: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const stopVoiceInput = () => {
+    if (!voiceRecogRef.current) return;
+    try {
+      voiceRecogRef.current.stop();
+    } catch { /* ignore */ }
+    setIsRecording(false);
+  };
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -942,7 +1175,46 @@ export default function Home() {
     } catch {
       // ignore
     }
+    // Load filter settings
+    try {
+      const raw = window.localStorage.getItem(FILTERS_STORAGE_KEY);
+      if (raw) {
+        const f = JSON.parse(raw) as Record<string, unknown>;
+        if (typeof f.sambaFilter === "string") setSambaFilter(f.sambaFilter);
+        if (typeof f.sambaContentFilter === "string") setSambaContentFilter(f.sambaContentFilter);
+        if (typeof f.sambaMaxDays === "number") setSambaMaxDays(f.sambaMaxDays);
+        if (typeof f.folderMaxDays === "number") setFolderMaxDays(f.folderMaxDays);
+        if (typeof f.autoAddLimit === "number") setAutoAddLimit(f.autoAddLimit);
+      }
+    } catch {
+      // ignore
+    }
   }, []);
+
+  // Persist filter settings to localStorage
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        FILTERS_STORAGE_KEY,
+        JSON.stringify({
+          sambaFilter,
+          sambaContentFilter,
+          sambaMaxDays,
+          folderMaxDays,
+          autoAddLimit,
+        })
+      );
+    } catch {
+      // ignore
+    }
+  }, [sambaFilter, sambaContentFilter, sambaMaxDays, folderMaxDays, autoAddLimit]);
+
+
+
+
+
+
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1015,6 +1287,100 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
+  }, [activeContext?.id]);
+
+  // Auto-load Samba file list when switching to a saved context with existing index
+  const autoLoadedContextRef = useRef<string | null>(null);
+  
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!activeContext?.sambaPath) return;
+    if (!dbIndexStatus.checked) return;
+    
+    const contextKey = `${activeContext.id}::${activeContext.sambaPath}`;
+    
+    // Skip if already auto-loaded for this context
+    if (autoLoadedContextRef.current === contextKey) return;
+    
+    const hasIndex = dbIndexStatus.hasContextIndex || dbIndexStatus.hasAnyIndex || Boolean(knowledgeBase?.initialized);
+    
+    if (!hasIndex) return;
+    
+    // Mark as loaded to prevent re-triggering
+    autoLoadedContextRef.current = contextKey;
+    
+    const currentSambaPath = activeContext.sambaPath.trim();
+    
+    // Set the samba path in the input
+    setSambaPath(currentSambaPath);
+    
+    let cancelled = false;
+    
+    const autoLoadSamba = async () => {
+      setIsSambaScanning(true);
+      setStatus("Načítám seznam souborů z úložiště...");
+      
+      try {
+        const controller = new AbortController();
+        sambaCancelRef.current = controller;
+        const timeoutId = setTimeout(
+          () => controller.abort(),
+          REQUEST_TIMEOUT_MS * 3
+        );
+        const response = await fetch("/api/samba", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sambaPath: currentSambaPath,
+            recursive: true,
+            maxFiles: 5000,
+            nameFilter: sambaFilter.trim(),
+            maxDays: sambaMaxDays,
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        
+        if (cancelled) return;
+        
+        const data = (await response.json()) as {
+          success?: boolean;
+          files?: SambaEntry[];
+          stats?: SambaStats;
+          error?: string;
+        };
+        
+        if (!response.ok) {
+          throw new Error(data.error ?? "Samba scan failed.");
+        }
+        
+        const files = data.files ?? [];
+        setSambaFiles(files);
+        setSambaStats(data.stats ?? null);
+        setLastScannedSambaPath(currentSambaPath);
+        setStatus(
+          `✓ Úložiště načteno: ${data.stats?.totalFiles} souborů (${data.stats?.totalSizeGB} GB). DB index je připraven — můžete se rovnou ptát v chatu.`
+        );
+      } catch (error) {
+        if (cancelled) return;
+        autoLoadedContextRef.current = null; // Reset, aby se dalo retry
+        setStatus(
+          error instanceof Error ? error.message : "Chyba načítání úložiště."
+        );
+      } finally {
+        if (!cancelled) {
+          sambaCancelRef.current = null;
+          setIsSambaScanning(false);
+        }
+      }
+    };
+    
+    autoLoadSamba();
+    return () => {
+      cancelled = true;
+    };
+    // Only react to context ID change (not status flags which change too often)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeContext?.id]);
 
   useEffect(() => {
@@ -1151,14 +1517,21 @@ export default function Home() {
   };
 
   const handleSearch = async () => {
-    const trimmed = query.trim().toLowerCase();
-    if (!trimmed) {
+    const nameInput = query.trim();
+    const contentInput = contentQuery.trim();
+    if (!nameInput && !contentInput) {
       setResults([]);
       return;
     }
+
+    // Parse include/exclude terms for filename and content
+    const nameParsed = parseSearchTerms(nameInput);
+    const contentParsed = parseSearchTerms(contentInput);
+    const hasContentFilter = contentParsed.include.length > 0 || contentParsed.exclude.length > 0;
+
     if (files.length === 0) {
       if (sambaFiles.length > 0) {
-        setSambaFilter(trimmed);
+        setSambaFilter(nameInput);
         setStatus("Filtroval jsem Samba soubory podle dotazu.");
       } else {
         setStatus("Nejprve vyberte lokální složku.");
@@ -1169,10 +1542,7 @@ export default function Home() {
     const controller = new AbortController();
     searchAbortRef.current = controller;
     setIsSearching(true);
-    setStatus("Searching...");
-
-    // Parse comma-separated terms (trim each, spaces inside terms are preserved)
-    const terms = trimmed.split(",").map((t) => t.trim()).filter((t) => t.length > 0);
+    setStatus("Hledám...");
 
     const matches: FileEntry[] = [];
     for (let index = 0; index < files.length; index += 1) {
@@ -1180,73 +1550,74 @@ export default function Home() {
         return;
       }
       const entry = files[index];
-      const pathLower = entry.path.toLowerCase();
-      let matched = false;
+      const pathNorm = normalizeCzech(entry.path);
 
-      if (searchMode === "and") {
-        // All terms must match
-        matched = true;
-        for (const term of terms) {
-          // Try matching term with optional dot prefix for extensions
-          const variations = [term, `.${term}`];
-          const pathMatch = variations.some((v) => pathLower.includes(v));
-          
-          if (!pathMatch && searchContent) {
-            try {
-              if (entry.size <= MAX_FILE_BYTES) {
-                const text = await readFileText(
-                  entry,
-                  MAX_FILE_BYTES,
-                  ocrMaxPages
-                );
-                if (!text.toLowerCase().includes(term)) {
-                  matched = false;
-                  break;
-                }
-              } else {
-                matched = false;
-                break;
-              }
-            } catch {
-              matched = false;
-              break;
-            }
-          } else if (!pathMatch) {
-            matched = false;
-            break;
-          }
+      // --- Filename matching ---
+      let nameOk = true;
+      
+      // Wildcard * = match all (just apply excludes)
+      const nameIsWildcard = nameParsed.include.length === 1 && nameParsed.include[0] === "*";
+      
+      if (!nameIsWildcard && nameParsed.include.length > 0) {
+        if (searchMode === "and") {
+          nameOk = nameParsed.include.every((t) => fuzzyContains(pathNorm, t));
+        } else {
+          nameOk = nameParsed.include.some((t) => fuzzyContains(pathNorm, t));
         }
-      } else {
-        // At least one term must match (OR)
-        for (const term of terms) {
-          const variations = [term, `.${term}`];
-          const pathMatch = variations.some((v) => pathLower.includes(v));
-          
-          if (pathMatch) {
-            matched = true;
-            break;
+      }
+      
+      // No exclude term may match the path
+      if (nameOk && nameParsed.exclude.length > 0) {
+        nameOk = !nameParsed.exclude.some((t) => fuzzyContains(pathNorm, t));
+      }
+
+      if (!nameOk) {
+        if ((index + 1) % SEARCH_BATCH_SIZE === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        continue;
+      }
+
+      // --- Days filter (folder files use lastModified from File handle) ---
+      if (folderMaxDays > 0 && entry.file) {
+        const cutoff = Date.now() - folderMaxDays * 86_400_000;
+        if (entry.file.lastModified < cutoff) {
+          if ((index + 1) % SEARCH_BATCH_SIZE === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
           }
-          if (searchContent) {
-            try {
-              if (entry.size <= MAX_FILE_BYTES) {
-                const text = await readFileText(
-                  entry,
-                  MAX_FILE_BYTES,
-                  ocrMaxPages
-                );
-                if (text.toLowerCase().includes(term)) {
-                  matched = true;
-                  break;
-                }
-              }
-            } catch {
-              // ignore
-            }
-          }
+          continue;
         }
       }
 
-      if (matched) {
+      // --- Content matching (only if content filter provided) ---
+      let contentOk = true;
+      const contentIsWildcard = contentParsed.include.length === 1 && contentParsed.include[0] === "*";
+      if (hasContentFilter) {
+        try {
+          if (entry.size <= MAX_FILE_BYTES) {
+            const text = await readFileText(entry, MAX_FILE_BYTES, ocrMaxPages);
+            const textNorm = normalizeCzech(text);
+            
+            if (!contentIsWildcard && contentParsed.include.length > 0) {
+              if (searchMode === "and") {
+                contentOk = contentParsed.include.every((t) => textNorm.includes(t));
+              } else {
+                contentOk = contentParsed.include.some((t) => textNorm.includes(t));
+              }
+            }
+            
+            if (contentOk && contentParsed.exclude.length > 0) {
+              contentOk = !contentParsed.exclude.some((t) => textNorm.includes(t));
+            }
+          } else {
+            contentOk = false;
+          }
+        } catch {
+          contentOk = false;
+        }
+      }
+
+      if (nameOk && contentOk) {
         matches.push(entry);
       }
       if ((index + 1) % SEARCH_BATCH_SIZE === 0) {
@@ -1254,8 +1625,15 @@ export default function Home() {
       }
     }
     setResults(matches);
+
+    const parts: string[] = [];
+    if (nameParsed.include.length) parts.push(`název obsahuje: ${nameParsed.include.join(", ")}`);
+    if (nameParsed.exclude.length) parts.push(`název NEobsahuje: ${nameParsed.exclude.join(", ")}`);
+    if (contentParsed.include.length) parts.push(`obsah obsahuje: ${contentParsed.include.join(", ")}`);
+    if (contentParsed.exclude.length) parts.push(`obsah NEobsahuje: ${contentParsed.exclude.join(", ")}`);
+    
     setStatus(
-      `Found ${matches.length} matches. Mode: ${searchMode === "and" ? "AND (všechny termíny)" : "OR (libovolný termín)"}`
+      `Nalezeno ${matches.length} souborů. ${searchMode.toUpperCase()} mód. ${parts.join(" | ")}`
     );
     setIsSearching(false);
   };
@@ -1288,10 +1666,15 @@ export default function Home() {
       setStatus("Enter a Samba path (e.g., /mnt/samba or //server/share)");
       return;
     }
+    
+    // If already scanning, do nothing (prevent double-click)
+    if (isSambaScanning) return;
+    
     setIsSambaScanning(true);
     setStatus("Scanning Samba share...");
     try {
       const controller = new AbortController();
+      sambaCancelRef.current = controller;
       const timeoutId = setTimeout(
         () => controller.abort(),
         REQUEST_TIMEOUT_MS * 3
@@ -1303,6 +1686,8 @@ export default function Home() {
           sambaPath: sambaPath.trim(),
           recursive: true,
           maxFiles: 5000,
+          nameFilter: sambaFilter.trim(),
+          maxDays: sambaMaxDays,
         }),
         signal: controller.signal,
       });
@@ -1312,25 +1697,51 @@ export default function Home() {
         files?: SambaEntry[];
         stats?: SambaStats;
         error?: string;
+        suggestedPaths?: Array<{ path: string; name: string }>;
       };
-      if (!response.ok) {
+      if (!response.ok && !data.suggestedPaths) {
         throw new Error(data.error ?? "Samba scan failed.");
       }
-      const files = data.files ?? [];
-      setSambaFiles(files);
-      setSambaStats(data.stats ?? null);
-      setStatus(
-        `✓ Nalezeno ${data.stats?.totalFiles} souborů (${data.stats?.totalSizeGB} GB)`
-      );
-      if (autoAddSamba) {
-        await addSambaFilesToContext(files);
+      
+      // Pokud jsou suggestions, zobraz je
+      if (data.suggestedPaths && data.suggestedPaths.length > 0) {
+        setSambaSuggestedPaths(data.suggestedPaths);
+        setStatus(data.error ?? "Nalezeny cesty s prefixem");
+        setSambaFiles([]);
+        setSambaStats(null);
+      } else {
+        const files = data.files ?? [];
+        setSambaFiles(files);
+        setSambaStats(data.stats ?? null);
+        setSambaSuggestedPaths([]);
+        setLastScannedSambaPath(sambaPath.trim());
+        setStatus(
+          `✓ Nalezeno ${data.stats?.totalFiles} souborů (${data.stats?.totalSizeGB} GB)`
+        );
+        if (autoAddSamba) {
+          await addSambaFilesToContext(files);
+        }
       }
     } catch (error) {
-      setStatus(
-        error instanceof Error ? error.message : "Chyba prohledávání  úložiště."
-      );
+      if (error instanceof Error && error.name === "AbortError") {
+        setStatus("Skenování zrušeno.");
+      } else {
+        setStatus(
+          error instanceof Error ? error.message : "Chyba prohledávání  úložiště."
+        );
+      }
+      setSambaSuggestedPaths([]);
     } finally {
+      sambaCancelRef.current = null;
       setIsSambaScanning(false);
+    }
+  };
+
+  const cancelSambaScan = () => {
+    if (sambaCancelRef.current) {
+      sambaCancelRef.current.abort();
+      sambaCancelRef.current = null;
+      setStatus("Skenování zrušeno uživatelem.");
     }
   };
 
@@ -1394,19 +1805,42 @@ export default function Home() {
   };
 
   const addSambaFilesToContext = async (files: SambaEntry[]) => {
+    // Detect changed files (same path but different modified date) — re-extract them
+    const changedFiles = files.filter((f) => {
+      if (f.type !== "file") return false;
+      const existing = fileContext.find((item) => item.path === f.path);
+      if (!existing) return false; // new file, handled below
+      // If modified dates differ, the file changed
+      return f.modified && existing.modified && f.modified !== existing.modified;
+    });
+
+    // Remove stale versions of changed files from context
+    if (changedFiles.length > 0) {
+      const changedPaths = new Set(changedFiles.map((f) => f.path));
+      setFileContext((prev) => prev.filter((item) => !changedPaths.has(item.path)));
+    }
+
+    // New files (not in context) + changed files (removed above, so no longer in context)
     let filesToAdd = files.filter(
       (f) =>
         f.type === "file" &&
-        !fileContext.some((item) => item.path === f.path)
+        (changedFiles.some((c) => c.path === f.path) ||
+         !fileContext.some((item) => item.path === f.path))
     );
     if (autoAddLimit > 0) {
       filesToAdd = filesToAdd.slice(0, autoAddLimit);
     }
     if (filesToAdd.length === 0) {
-      setStatus("Všechny soubory jsou již v kontextu.");
+      setStatus("Všechny soubory jsou již v kontextu a aktuální.");
       return;
     }
-    setStatus(`Extrahuji ${filesToAdd.length} souborů...`);
+    const newCount = filesToAdd.length - changedFiles.length;
+    const changedCount = changedFiles.filter((c) => filesToAdd.some((f) => f.path === c.path)).length;
+    const label = [
+      newCount > 0 ? `${newCount} nových` : "",
+      changedCount > 0 ? `${changedCount} změněných` : "",
+    ].filter(Boolean).join(" + ");
+    setStatus(`Extrahuji ${filesToAdd.length} souborů (${label})...`);
     setLoadProgress({ label: "Start", percent: 0 });
     let added = 0;
     let failed = 0;
@@ -1486,11 +1920,44 @@ export default function Home() {
       );
       return;
     }
-    setStatus(`✓ Added ${added} files to context. Neúspěšné: ${failed}`);
+    const updatedSuffix = changedCount > 0 ? ` (${changedCount} aktualizováno)` : "";
+    setStatus(`✓ Přidáno ${added} souborů do kontextu${updatedSuffix}. Neúspěšné: ${failed}`);
+  };
+
+  /** Apply name filter + days filter to samba file list */
+  const filterSambaFiles = (allFiles: SambaEntry[]): SambaEntry[] => {
+    let result = allFiles;
+    // Name filter
+    const hasNameFilter = sambaFilter.trim().length > 0;
+    if (hasNameFilter) {
+      const parsed = parseSearchTerms(sambaFilter);
+      const isWild = parsed.include.length === 1 && parsed.include[0] === "*";
+      result = result.filter((f) => {
+        const text = normalizeCzech(`${String(f.path)} ${String(f.name ?? "")}`);
+        if (!isWild && parsed.include.length > 0) {
+          if (!parsed.include.every((t) => fuzzyContains(text, t))) return false;
+        }
+        if (parsed.exclude.length > 0) {
+          if (parsed.exclude.some((t) => fuzzyContains(text, t))) return false;
+        }
+        return true;
+      });
+    }
+    // Days filter
+    if (sambaMaxDays > 0) {
+      const cutoff = Date.now() - sambaMaxDays * 86_400_000;
+      result = result.filter((f) => {
+        const ts = f.modified ? new Date(f.modified).getTime() : 0;
+        return ts >= cutoff;
+      });
+    }
+    return result;
   };
 
   const handleAddAllSambaToContext = async () => {
-    await addSambaFilesToContext(sambaFiles);
+    const allFiles = sambaFiles.filter((f) => f.type === "file");
+    const filtered = filterSambaFiles(allFiles);
+    await addSambaFilesToContext(filtered);
   };
 
   const handleAddToContext = async () => {
@@ -1976,6 +2443,7 @@ export default function Home() {
     setStatus("Indexing files...");
     setIndexProgress({ label: "Příprava", percent: 0 });
     try {
+      const contextPrefix = activeContext?.id ? `${activeContext.id}:` : "";
       const filesPayload = fileContext.map((f, index) => {
         const percent = Math.round(((index + 1) / fileContext.length) * 50);
         setIndexProgress({
@@ -1983,7 +2451,7 @@ export default function Home() {
           percent,
         });
         return {
-          name: f.path,
+          name: contextPrefix ? `${contextPrefix}${f.path}` : f.path,
           content: f.content,
         };
       });
@@ -2364,6 +2832,47 @@ export default function Home() {
         return;
       }
 
+      // Otázky o metadatech/stavu systému (před počítáním výskytů v souborech)
+      const asksAboutSystemStatus =
+        /(kolik\s*(je|m[aá]m|m[aá]me|obsahuje|načten[ýo]|v|zaindexovan[ýo])\s*(soubor[ůy]|chunk[ůy]|dokument[ůy]|text[ůy])(\s*(v|v\s*)?(kontext|databáz|knowledge|kb))?)|(počet\s*(soubor[ůy]|chunk[ůy]|dokument[ůy]))|(jak\s*(velk[áý]|velk[éý])\s*(je\s*)?(databáze|db|knowledge\s*base|kontext))|(co\s*je\s*v\s*knowledge\s*base)/i.test(
+          trimmed
+        );
+
+      if (asksAboutSystemStatus) {
+        const kbInfo = [];
+        if (knowledgeBase && knowledgeBase.totalFiles > 0) {
+          kbInfo.push(`📁 Celkem zaindexováno souborů: **${knowledgeBase.totalFiles}**`);
+        }
+        if (knowledgeBase && knowledgeBase.totalChunks > 0) {
+          kbInfo.push(`📦 Celkem chunks (textových bloků): **${knowledgeBase.totalChunks}**`);
+        }
+        if (knowledgeBase && knowledgeBase.embeddingDimension) {
+          kbInfo.push(`📐 Dimenze embeddings: **${knowledgeBase.embeddingDimension}**`);
+        }
+        if (knowledgeBase && knowledgeBase.lastIndexedAt) {
+          const date = new Date(knowledgeBase.lastIndexedAt);
+          kbInfo.push(`🕒 Poslední indexace: **${date.toLocaleString("cs-CZ")}**`);
+        }
+        if (fileContext.length > 0) {
+          kbInfo.push(`\n💾 V UI kontextu (prohlížeč): **${fileContext.length} souborů** (${(contextText.length / 1024).toFixed(1)} KB textu)`);
+        } else {
+          kbInfo.push(`\n💾 UI kontext: **prázdný** (můžete načíst soubory tlačítkem "Načíst do UI kontextu")`);
+        }
+        
+        const infoText = (knowledgeBase && knowledgeBase.totalFiles > 0) || fileContext.length > 0
+          ? `${knowledgeBase?.readyForSearch ? 'Knowledge base je připravena k vyhledávání:\n\n' : ''}${kbInfo.join("\n")}`
+          : "Knowledge base zatím není inicializována a UI kontext je prázdný.";
+          
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text: infoText,
+          },
+        ]);
+        return;
+      }
+
       // Local utility: counting string occurrences across currently loaded file contents.
       // This avoids model hallucinations and works even when context is truncated.
       const isCountRequest =
@@ -2495,7 +3004,7 @@ export default function Home() {
       const endpoint = hasDbIndex ? "/api/search" : "/api/gemini";
       const body =
         hasDbIndex
-          ? JSON.stringify({ query: trimmed })
+          ? JSON.stringify({ query: trimmed, contextId: activeContext?.id ?? undefined })
           : JSON.stringify({ message: trimmed, context: contextText });
 
       let response: Response;
@@ -2513,16 +3022,28 @@ export default function Home() {
       if (!response.ok) {
         throw new Error(data.error ?? "Request failed.");
       }
-      const { cleanText, chart } = extractChartBlock(data.text ?? "");
+      let processedText = data.text ?? "";
+      
+      // Extract chart
+      const { cleanText: textAfterChart, chart } = extractChartBlock(processedText);
       if (chart) {
         setAssistantCharts((prev) => [
           ...prev,
           { ...chart, id: generateUUID() },
         ]);
       }
+      processedText = textAfterChart;
+      
+      // Extract structured results
+      const { cleanText: finalText, structured } = extractStructuredBlock(processedText);
+      if (structured) {
+        setStructuredResult(structured);
+        setActiveTab("results");
+      }
+      
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", text: cleanText || data.text || "" },
+        { role: "assistant", text: finalText || data.text || "" },
       ]);
     } catch (error) {
       setMessages((prev) => [
@@ -2546,17 +3067,18 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
-      <main className="mx-auto flex w-full max-w-6xl flex-col gap-10 px-6 py-12">
+      <main className="mx-auto flex w-full max-w-[1600px] flex-col gap-10 px-6 py-12">
         <header className="flex flex-col gap-4">
           <p className="text-sm uppercase tracking-[0.3em] text-slate-400">
-            Gemini + Hledaní souborů
+            {/* Jardovo hledání */}
+            Jardovo hledání
           </p>
           <h1 className="text-3xl font-semibold sm:text-4xl">
-            Hledaní s Gemini asistencí
+            Hledaní s Jardovou asistencí
           </h1>
           <p className="max-w-2xl text-slate-300">
             Vyberte místní složku, vyhledejte soubory podle názvu nebo obsahu a odešlete
-            vybraný obsah souboru do Gemini.
+            vybraný obsah souboru  Jardovi.
           </p>
         </header>
 
@@ -2595,22 +3117,157 @@ export default function Home() {
                 className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100 placeholder-slate-500"
                 placeholder="Samba path (e.g., /mnt/samba or //server/share)"
                 value={sambaPath}
-                onChange={(e) => setSambaPath(e.target.value)}
+                onChange={(e) => {
+                  setSambaPath(e.target.value);
+                  // Clear stale results when path differs from last scan
+                  if (e.target.value.trim() !== lastScannedSambaPath) {
+                    setSambaFiles([]);
+                    setSambaStats(null);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && sambaPath.trim() && !isSambaScanning) {
+                    handleSambaScan();
+                  }
+                }}
               />
               <button
-                className="rounded-2xl border border-slate-700 px-4 py-2 text-sm font-semibold"
+                className={`rounded-2xl border px-4 py-2 text-sm font-semibold ${
+                  sambaPath.trim() && sambaPath.trim() !== lastScannedSambaPath
+                    ? "border-amber-600 bg-amber-900/30 text-amber-200 animate-pulse"
+                    : "border-slate-700"
+                }`}
                 onClick={handleSambaScan}
                 disabled={!sambaPath || isSambaScanning}
               >
-                {isSambaScanning ? "Prohledávání..." : "Prohledat úložiště"}
+                {isSambaScanning
+                  ? "Prohledávání..."
+                  : sambaPath.trim() && sambaPath.trim() !== lastScannedSambaPath
+                    ? "⟳ Prohledat novou cestu"
+                    : "Prohledat úložiště"}
               </button>
+              {isSambaScanning && (
+                <button
+                  className="rounded-2xl border border-red-600 bg-red-900/30 px-4 py-2 text-sm font-semibold text-red-200 hover:bg-red-900/50 transition"
+                  onClick={cancelSambaScan}
+                >
+                  ⊗ Zastavit
+                </button>
+              )}
             </div>
+            {sambaSuggestedPaths.length > 0 && (
+              <div className="mt-2 rounded-2xl border border-amber-700/50 bg-amber-900/20 p-3">
+                <p className="text-xs text-amber-200 font-semibold mb-2">
+                  Doporučené cesty (začínající na "{sambaPath.split('/').pop()}"):
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {sambaSuggestedPaths.map((suggested) => (
+                    <button
+                      key={suggested.path}
+                      className="rounded-xl border border-amber-600 bg-amber-900/40 px-3 py-1 text-xs text-amber-200 hover:bg-amber-900/60 transition"
+                      onClick={async () => {
+                        setSambaPath(suggested.path);
+                        setSambaSuggestedPaths([]);
+                        // Automaticky scanuj po výběru
+                        setIsSambaScanning(true);
+                        setStatus("Scanning Samba share...");
+                        try {
+                          const controller = new AbortController();
+                          const timeoutId = setTimeout(
+                            () => controller.abort(),
+                            REQUEST_TIMEOUT_MS * 3
+                          );
+                          const response = await fetch("/api/samba", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              sambaPath: suggested.path,
+                              recursive: true,
+                              maxFiles: 5000,
+                              nameFilter: sambaFilter.trim(),
+                              maxDays: sambaMaxDays,
+                            }),
+                            signal: controller.signal,
+                          });
+                          clearTimeout(timeoutId);
+                          const data = (await response.json()) as {
+                            success?: boolean;
+                            files?: SambaEntry[];
+                            stats?: SambaStats;
+                            error?: string;
+                            suggestedPaths?: Array<{ path: string; name: string }>;
+                          };
+                          if (!response.ok && !data.suggestedPaths) {
+                            throw new Error(data.error ?? "Samba scan failed.");
+                          }
+                          
+                          if (data.suggestedPaths && data.suggestedPaths.length > 0) {
+                            setSambaSuggestedPaths(data.suggestedPaths);
+                            setStatus(data.error ?? "Nalezeny cesty s prefixem");
+                            setSambaFiles([]);
+                            setSambaStats(null);
+                          } else {
+                            const files = data.files ?? [];
+                            setSambaFiles(files);
+                            setSambaStats(data.stats ?? null);
+                            setSambaSuggestedPaths([]);
+                            setLastScannedSambaPath(suggested.path);
+                            setStatus(
+                              `✓ Nalezeno ${data.stats?.totalFiles} souborů (${data.stats?.totalSizeGB} GB)`
+                            );
+                          }
+                        } catch (error) {
+                          setStatus(
+                            error instanceof Error ? error.message : "Chyba prohledávání  úložiště."
+                          );
+                          setSambaSuggestedPaths([]);
+                        } finally {
+                          setIsSambaScanning(false);
+                        }
+                      }}
+                    >
+                      {suggested.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             {sambaStats && (
               <p className="text-xs text-slate-400">
                 Nalezeno {sambaStats.totalFiles} souborů ({sambaStats.totalSizeGB}{" "}
                 GB)
               </p>
             )}
+            <div className="mt-1">
+              <p className="text-[11px] text-slate-500 mb-1">
+                Filtr: čárkou oddělené, <code className="bg-slate-800 px-1 rounded">!</code> = vyloučit, <code className="bg-slate-800 px-1 rounded">*</code> = vše. Př.: <code className="bg-slate-800 px-1 rounded">docx, !eon</code>
+              </p>
+              <div className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
+                <input
+                  className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100 placeholder-slate-500"
+                  placeholder="Název souboru: docx, smlouva, !eon"
+                  value={sambaFilter}
+                  onChange={(e) => setSambaFilter(e.target.value)}
+                />
+                <input
+                  className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100 placeholder-slate-500"
+                  placeholder="Obsah souboru: faktura, !zrušeno"
+                  value={sambaContentFilter}
+                  onChange={(e) => setSambaContentFilter(e.target.value)}
+                />
+                <div className="flex items-center gap-1 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
+                  <span className="whitespace-nowrap">Dny</span>
+                  <input
+                    type="number"
+                    min={0}
+                    className="w-16 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
+                    value={sambaMaxDays}
+                    onChange={(e) => setSambaMaxDays(Math.max(0, Number(e.target.value) || 0))}
+                    title="Změna za posledních X dní (0 = vše)"
+                  />
+                </div>
+              </div>
+            </div>
             <label className="flex items-center gap-2 text-xs text-slate-300">
               <input
                 type="checkbox"
@@ -2816,39 +3473,61 @@ export default function Home() {
               </div>
             )}
           </div>
-          <div className="grid gap-3 md:grid-cols-[1fr_auto_auto_auto]">
-            <input
-              className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
-              placeholder="Hledat soubory (oddělené čárkou: xlsx, sick leave)..."
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-            <div className="flex items-center gap-2 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
-              <span>OCR str.</span>
-              <input
-                type="number"
-                min={1}
-                max={50}
-                className="w-16 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
-                value={ocrMaxPages}
-                onChange={(event) =>
-                  setOcrMaxPages(
-                    Math.min(50, Math.max(1, Number(event.target.value) || 1))
-                  )
-                }
-              />
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-1 text-[11px] text-slate-500">
+              <span>Syntaxe: čárkou, <code className="bg-slate-800 px-1 rounded">!</code> = vyloučit, <code className="bg-slate-800 px-1 rounded">*</code> = vše. Př.: <code className="bg-slate-800 px-1 rounded">*, !eon</code> nebo <code className="bg-slate-800 px-1 rounded">docx, smlouva, !archiv</code></span>
             </div>
-            <button
-              className="rounded-2xl border border-slate-700 px-4 py-2 text-sm"
-              onClick={handleSearch}
-              disabled={!files.length || isSearching}
-            >
-              {isSearching ? "Hledání..." : "Hledat"}
-            </button>
-            <div className="flex items-center gap-2">
+            <div className="grid gap-3 md:grid-cols-[1fr_1fr_auto_auto_auto]">
+              <input
+                className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
+                placeholder="Název souboru: docx, smlouva, !eon ..."
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") handleSearch(); }}
+              />
+              <input
+                className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
+                placeholder="Obsah souboru: faktura, !zruseno ..."
+                value={contentQuery}
+                onChange={(event) => setContentQuery(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") handleSearch(); }}
+              />
+              <div className="flex items-center gap-2 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
+                <span>OCR str.</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  className="w-16 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
+                  value={ocrMaxPages}
+                  onChange={(event) =>
+                    setOcrMaxPages(
+                      Math.min(50, Math.max(1, Number(event.target.value) || 1))
+                    )
+                  }
+                />
+              </div>
+              <div className="flex items-center gap-1 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
+                <span className="whitespace-nowrap">Dny</span>
+                <input
+                  type="number"
+                  min={0}
+                  className="w-16 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
+                  value={folderMaxDays}
+                  onChange={(event) => setFolderMaxDays(Math.max(0, Number(event.target.value) || 0))}
+                  title="Změna za posledních X dní (0 = vše)"
+                />
+              </div>
+              <button
+                className="rounded-2xl border border-slate-700 px-4 py-2 text-sm"
+                onClick={handleSearch}
+                disabled={(!files.length && !sambaFiles.length) || isSearching}
+              >
+                {isSearching ? "Hledám..." : "Hledat"}
+              </button>
               <button
                 onClick={() => setSearchMode(searchMode === "and" ? "or" : "and")}
-                className={`px-3 py-1 text-xs rounded-full font-semibold transition ${
+                className={`px-3 py-2 text-xs rounded-2xl font-semibold transition ${
                   searchMode === "and"
                     ? "bg-slate-700 text-slate-100"
                     : "bg-slate-800 text-slate-400"
@@ -2857,14 +3536,6 @@ export default function Home() {
                 {searchMode === "and" ? "AND" : "OR"}
               </button>
             </div>
-            <label className="flex items-center gap-2 text-sm text-slate-300">
-              <input
-                type="checkbox"
-                checked={searchContent}
-                onChange={(event) => setSearchContent(event.target.checked)}
-              />
-              V obsahu
-            </label>
           </div>
 
           {status && <p className="text-sm text-slate-400">{status}</p>}
@@ -2959,75 +3630,100 @@ export default function Home() {
               </div>
             </div>
 
-            {sambaFiles.length > 0 && (
+            {(sambaFiles.length > 0 || sambaPath.trim()) && (
               <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
                 <div className="flex items-center justify-between">
                   <h2 className="text-sm font-semibold text-slate-200">
                     Síťové soubory ({sambaFiles.filter((f) => f.type === "file").length})
                   </h2>
-                  {sambaFilter && (
-                    <button
-                      className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
-                      onClick={() => setSambaFilter("")}
-                    >
-                      Zrušit filtr
-                    </button>
-                  )}
-                  {sambaFiles.filter((f) => f.type === "file").length > 0 && (
-                    <button
-                      className="text-xs px-2 py-1 rounded bg-emerald-900 hover:bg-emerald-800 text-emerald-200"
-                      onClick={handleAddAllSambaToContext}
-                    >
-                      + Add All
-                    </button>
-                  )}
-                </div>
-                <div className="mt-3 max-h-72 space-y-2 overflow-auto text-sm">
-                  {sambaFiles
-                    .filter((f) => f.type === "file")
-                    .filter((f) =>
-                      sambaFilter
-                        ? String(f.name ?? f.path)
-                            .toLowerCase()
-                            .includes(sambaFilter)
-                        : true
-                    )
-                    .slice(0, 100)
-                    .map((file) => (
+                  <div className="flex items-center gap-2">
+                    {(sambaFilter || sambaContentFilter || sambaMaxDays > 0) && (
                       <button
-                        key={file.path}
-                        className="w-full text-left flex items-start justify-between gap-2 rounded-xl border border-slate-800 bg-slate-900/40 px-3 py-2 hover:bg-slate-900/60 transition"
-                        onClick={() => handleAddSambaToContext(file.path)}
+                        className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                        onClick={() => { setSambaFilter(""); setSambaContentFilter(""); setSambaMaxDays(0); }}
                       >
-                        <div>
-                          <p className="font-medium text-slate-100">
-                            {file.name}
-                          </p>
-                          <p className="text-xs text-slate-400">
-                            {(file.size / 1024).toFixed(1)} KB
-                            {file.modified && (
-                              <span>
-                                {" "}• {new Date(file.modified).toLocaleString()}
-                              </span>
-                            )}
-                            {file.created && (
-                              <span>
-                                {" "}• vytvořeno {new Date(
-                                  file.created
-                                ).toLocaleString()}
-                              </span>
-                            )}
-                          </p>
-                        </div>
-                        <span className="text-xs text-emerald-400">+ Add</span>
+                        Zrušit filtry
                       </button>
-                    ))}
-                  {sambaFiles.filter((f) => f.type === "file").length > 100 && (
-                    <p className="text-xs text-slate-500">
-                      ... showing first 100 files
-                    </p>
-                  )}
+                    )}
+                    {sambaFiles.filter((f) => f.type === "file").length > 0 && (
+                      <button
+                        className="text-xs px-2 py-1 rounded bg-emerald-900 hover:bg-emerald-800 text-emerald-200"
+                        onClick={handleAddAllSambaToContext}
+                      >
+                        + Add All
+                      </button>
+                    )}
+                  </div>
                 </div>
+                {(() => {
+                  const allFiles = sambaFiles.filter((f) => f.type === "file");
+                  const hasContentFilterSamba = sambaContentFilter.trim().length > 0;
+                  const hasAnyFilter = sambaFilter.trim().length > 0 || sambaMaxDays > 0;
+                  
+                  const filtered = filterSambaFiles(allFiles);
+                  
+                  const filterCount = hasAnyFilter ? filtered.length : allFiles.length;
+                  
+                  return (
+                    <>
+                      {(hasAnyFilter || hasContentFilterSamba) && (
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          {"Filtr: "}{filterCount}{" / "}{allFiles.length}{" soubor\u016f"}
+                          {sambaMaxDays > 0 && (
+                            <span className="ml-2 text-amber-400">{`posledn\u00edch ${sambaMaxDays} dn\u00ed`}</span>
+                          )}
+                          {hasContentFilterSamba && (
+                            <span className="ml-2 text-blue-400">{"+ filtr obsahu (aplikuje se p\u0159i p\u0159id\u00e1n\u00ed do kontextu)"}</span>
+                          )}
+                        </p>
+                      )}
+                      <div className="mt-3 max-h-72 space-y-2 overflow-auto text-sm">
+                        {filtered.length === 0 && allFiles.length > 0 && (
+                          <p className="text-xs text-slate-500">Žádné soubory neodpovídají filtru.</p>
+                        )}
+                        {filtered.length === 0 && allFiles.length === 0 && (
+                          <p className="text-xs text-slate-500">Klikněte "Prohledat úložiště" pro načtení souborů.</p>
+                        )}
+                        {filtered
+                          .slice(0, 200)
+                          .map((file) => (
+                            <button
+                              key={file.path}
+                              className="w-full text-left flex items-start justify-between gap-2 rounded-xl border border-slate-800 bg-slate-900/40 px-3 py-2 hover:bg-slate-900/60 transition"
+                              onClick={() => handleAddSambaToContext(file.path)}
+                            >
+                              <div>
+                                <p className="font-medium text-slate-100">
+                                  {file.name}
+                                </p>
+                                <p className="text-xs text-slate-400">
+                                  {(file.size / 1024).toFixed(1)} KB
+                                  {file.modified && (
+                                    <span>
+                                      {" \u2022 "}{new Date(file.modified).toLocaleString()}
+                                    </span>
+                                  )}
+                                  {file.created && (
+                                    <span>
+                                      {" \u2022 vytvo\u0159eno "}{new Date(
+                                        file.created
+                                      ).toLocaleString()}
+                                    </span>
+                                  )}
+                                </p>
+                              </div>
+                              <span className="text-xs text-emerald-400">+ Add</span>
+                            </button>
+                          ))}
+                        {filtered.length > 200 && (
+                          <p className="text-xs text-slate-500">
+                            {"... zobrazeno prvn\u00edch 200 z "}{filtered.length}
+                          </p>
+                        )}
+                      </div>
+                    </>
+                  );
+                })()}
               </div>
             )}
 
@@ -3235,46 +3931,231 @@ export default function Home() {
         </section>
 
         <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
-          <h2 className="text-lg font-semibold">Gemini chat</h2>
-          <div className="max-h-96 space-y-4 overflow-auto rounded-2xl border border-slate-800 bg-slate-950 p-4">
-            {messages.length === 0 && (
-              <p className="text-sm text-slate-500">
-                Zeptejte se Gemini něco pomocí kontextu souborů výše.
-              </p>
-            )}
-            {messages.map((message, index) => (
-              <div
-                key={`${message.role}-${index}`}
-                className={
-                  message.role === "user"
-                    ? "rounded-2xl bg-slate-800 px-4 py-3 text-sm"
-                    : "rounded-2xl bg-emerald-500/10 px-4 py-3 text-sm"
-                }
+          <div className="flex flex-wrap items-center gap-3 justify-between">
+            <h2 className="text-lg font-semibold">Gemini asistent</h2>
+            <div className="flex gap-2">
+              <button
+                className={`px-4 py-2 rounded-xl text-sm font-semibold transition ${
+                  activeTab === "chat"
+                    ? "bg-emerald-400 text-slate-900"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+                onClick={() => setActiveTab("chat")}
               >
-                <p className="text-xs uppercase text-slate-400">
-                  {message.role}
-                </p>
-                <p className="mt-2 whitespace-pre-wrap text-slate-100">
-                  {message.text}
-                </p>
+                Chat
+              </button>
+              <button
+                className={`px-4 py-2 rounded-xl text-sm font-semibold transition ${
+                  activeTab === "results"
+                    ? "bg-emerald-400 text-slate-900"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+                onClick={() => setActiveTab("results")}
+              >
+                Strukturované výsledky
+                {structuredResult && (
+                  <span className="ml-2 bg-emerald-500 text-slate-900 rounded-full px-2 py-0.5 text-xs">
+                    {structuredResult.groups.length}
+                  </span>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {activeTab === "chat" && (
+            <>
+              {/* Status indikátor zdroje dat */}
+              <div className={`flex items-center gap-2 rounded-xl px-3 py-2 text-xs ${
+                hasDbIndex
+                  ? "bg-emerald-500/10 border border-emerald-500/30 text-emerald-300"
+                  : fileContext.length > 0
+                    ? "bg-blue-500/10 border border-blue-500/30 text-blue-300"
+                    : "bg-amber-500/10 border border-amber-500/30 text-amber-300"
+              }`}>
+                <span className={`inline-block h-2 w-2 rounded-full ${
+                  hasDbIndex ? "bg-emerald-400 animate-pulse" : fileContext.length > 0 ? "bg-blue-400" : "bg-amber-400"
+                }`} />
+                {hasDbIndex ? (
+                  <span>
+                    ✓ DB index připraven — vyhledávání funguje okamžitě
+                    {knowledgeBase && knowledgeBase.totalFiles > 0 && (
+                      <span className="text-emerald-400/60 ml-1">
+                        ({knowledgeBase.totalFiles} souborů, {knowledgeBase.totalChunks} chunks)
+                      </span>
+                    )}
+                  </span>
+                ) : fileContext.length > 0 ? (
+                  <span>UI kontext: {fileContext.length} souborů — Gemini odpovídá z načtených dat</span>
+                ) : (
+                  <span>Žádný zdroj dat — vyberte kontext nebo připojte úložiště a indexujte</span>
+                )}
               </div>
-            ))}
-          </div>
-          <div className="grid gap-3 md:grid-cols-[1fr_auto]">
-            <textarea
-              className="min-h-[96px] w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-slate-100"
-              placeholder="Zeptejte se..."
-              value={chatInput}
-              onChange={(event) => setChatInput(event.target.value)}
-            />
-            <button
-              className="h-fit rounded-2xl bg-slate-100 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60"
-              onClick={handleSend}
-              disabled={isSending}
-            >
-              {isSending ? "Odesílám..." : "Odeslat"}
-            </button>
-          </div>
+
+              <div className="max-h-96 space-y-4 overflow-auto rounded-2xl border border-slate-800 bg-slate-950 p-4">
+                {messages.length === 0 && (
+                  <p className="text-sm text-slate-500">
+                    {hasDbIndex 
+                      ? "Index je připraven. Ptejte se na cokoli \u2014 nap\u0159.: \u201EM\u00e1m klienta EON, co k tomu pat\u0159\u00ed?\u201C"
+                      : "Zeptejte se Gemini n\u011bco pomoc\u00ed kontextu soubor\u016f v\u00fd\u0161e. Nap\u0159.: \u201EM\u00e1m klienta Colonnade a Helvetia, zkus mi dohledat co ke komu pat\u0159\u00ed\u201C"}
+                  </p>
+                )}
+                {messages.map((message, index) => (
+                  <div
+                    key={`${message.role}-${index}`}
+                    className={
+                      message.role === "user"
+                        ? "rounded-2xl bg-slate-800 px-4 py-3 text-sm"
+                        : "rounded-2xl bg-emerald-500/10 px-4 py-3 text-sm"
+                    }
+                  >
+                    <p className="text-xs uppercase text-slate-400">
+                      {message.role}
+                    </p>
+                    <p className="mt-2 whitespace-pre-wrap text-slate-100">
+                      {message.text}
+                    </p>
+                  </div>
+                ))}
+              </div>
+              <div className="grid gap-3 md:grid-cols-[1fr_auto_auto]">
+                <textarea
+                  className="min-h-[96px] w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-slate-100"
+                  placeholder="Zeptejte se..."
+                  value={chatInput}
+                  onChange={(event) => setChatInput(event.target.value)}
+                />
+                
+                <button
+                  className="h-fit rounded-2xl bg-slate-100 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60"
+                  onClick={handleSend}
+                  disabled={isSending}
+                >
+                  {isSending ? "Odesílám..." : "Odeslat"}
+                </button>
+
+                  <button
+                    className={`h-fit rounded-2xl px-5 py-3 text-sm font-semibold transition disabled:opacity-60 ${
+                      isRecording
+                        ? "bg-rose-500 text-slate-100 animate-pulse"
+                        : "bg-slate-700 text-slate-100 hover:bg-slate-600"
+                    }`}
+                    onClick={isRecording ? stopVoiceInput : startVoiceInput}
+                    disabled={isSending}
+                    title={
+                      !voiceSupported
+                        ? "Hlasove diktovani neni v tomto prohlizeci dostupne"
+                        : isRecording
+                          ? "Zastavit nahravani"
+                          : "Mluvit (cs-CZ)"
+                    }
+                  >
+                    {isRecording ? "⏹" : "🎤"}
+                  </button>
+
+              </div>
+              <p className="text-xs text-slate-400">
+                {!voiceSupported
+                  ? "Hlasove diktovani neni v tomto prohlizeci dostupne."
+                  : typeof window !== "undefined" && !window.isSecureContext
+                    ? "Hlasove diktovani vyzaduje HTTPS nebo localhost."
+                    : "Napište otázku"}
+              </p>
+            </>
+          )}
+
+          {activeTab === "results" && (
+            <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+              {structuredResult ? (
+                <div className="space-y-6">
+                  {structuredResult.summary && (
+                    <div className="rounded-xl bg-emerald-500/10 border border-emerald-500/30 p-4">
+                      <p className="text-sm text-emerald-100">{structuredResult.summary}</p>
+                    </div>
+                  )}
+                  {structuredResult.groups.map((group, groupIdx) => (
+                    <div key={groupIdx} className="space-y-3">
+                      <h3 className="text-lg font-semibold text-emerald-400 flex items-center gap-2">
+                        <span className="rounded-lg bg-emerald-500/20 px-3 py-1">
+                          {group.client}
+                        </span>
+                        <span className="text-xs text-slate-400">
+                          ({group.files.length} souborů)
+                        </span>
+                      </h3>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="border-b border-slate-700">
+                              <th className="text-left py-2 px-3 text-slate-300 font-medium">#</th>
+                              <th className="text-left py-2 px-3 text-slate-300 font-medium">Soubor</th>
+                              <th className="text-left py-2 px-3 text-slate-300 font-medium">Popis</th>
+                              <th className="text-left py-2 px-3 text-slate-300 font-medium">Velikost</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {group.files.map((file, fileIdx) => (
+                              <tr key={fileIdx} className="border-b border-slate-800 hover:bg-slate-900/50">
+                                <td className="py-2 px-3 text-slate-400">{fileIdx + 1}</td>
+                                <td className="py-2 px-3">
+                                  <a
+                                    className="text-emerald-400 hover:text-emerald-300 hover:underline text-left break-all"
+                                    href={`/api/download?path=${encodeURIComponent(file.path)}`}
+                                    onClick={() => {
+                                      const found = files.find((f) => f.path === file.path) ||
+                                        sambaFiles.find((f) => f.path === file.path);
+                                      if (found) {
+                                        setSelectedPaths(new Set([file.path]));
+                                        setStatus(`Vybrán: ${file.path}`);
+                                      }
+                                    }}
+                                    title="Stáhnout soubor"
+                                  >
+                                    {file.path.split("/").pop() || file.path}
+                                  </a>
+                                  <div className="text-xs text-slate-500 mt-1">
+                                    {file.path}
+                                  </div>
+                                </td>
+                                <td className="py-2 px-3 text-slate-300">
+                                  {file.description || "-"}
+                                </td>
+                                <td className="py-2 px-3 text-slate-400">
+                                  {file.size ? `${(file.size / 1024).toFixed(1)} KB` : "-"}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  ))}
+                  <div className="flex gap-3 pt-4 border-t border-slate-700">
+                    <button
+                      className="rounded-xl bg-emerald-500 hover:bg-emerald-600 px-4 py-2 text-sm font-semibold text-slate-900 transition"
+                      onClick={() => {
+                        const allPaths = structuredResult.groups.flatMap(g => g.files.map(f => f.path));
+                        setSelectedPaths(new Set(allPaths));
+                        setStatus(`Vybráno ${allPaths.length} souborů`);
+                      }}
+                    >
+                      Vybrat všechny soubory
+                    </button>
+                    <button
+                      className="rounded-xl bg-slate-700 hover:bg-slate-600 px-4 py-2 text-sm font-semibold text-slate-100 transition"
+                      onClick={() => setStructuredResult(null)}
+                    >
+                      Vymazat výsledky
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">
+                  Zatím žádné strukturované výsledky. Zeptejte se v chatu například: 
+                  "Mám klienta Colonnade a Helvetia, zkus mi dohledat co ke komu patří"
+                </p>
+              )}
+            </div>
+          )}
         </section>
       </main>
     </div>
