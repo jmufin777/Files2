@@ -3,7 +3,7 @@ import { Pool } from "pg";
 
 export const runtime = "nodejs";
 
-export async function GET() {
+export async function GET(request: Request) {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
     return NextResponse.json(
@@ -11,6 +11,10 @@ export async function GET() {
       { status: 500 }
     );
   }
+
+  // Parse query parameters
+  const { searchParams } = new URL(request.url);
+  const prefix = searchParams.get("prefix") || null;
 
   const pool = new Pool({ connectionString: databaseUrl });
 
@@ -28,15 +32,21 @@ export async function GET() {
       });
     }
 
+    // Build WHERE clause for prefix filtering
+    const whereClause = prefix ? "WHERE metadata->>'source' LIKE $1" : "";
+    const queryParams: any[] = prefix ? [`${prefix}%`] : [];
+
     // Count total chunks
     const chunkCount = await pool.query<{ count: string }>(
-      "SELECT COUNT(*) as count FROM file_index"
+      `SELECT COUNT(*) as count FROM file_index ${whereClause}`,
+      queryParams
     );
     const totalChunks = parseInt(chunkCount.rows[0]?.count ?? "0", 10);
 
     // Count unique files
     const fileCount = await pool.query<{ count: string }>(
-      "SELECT COUNT(DISTINCT metadata->>'source') as count FROM file_index"
+      `SELECT COUNT(DISTINCT metadata->>'source') as count FROM file_index ${whereClause}`,
+      queryParams
     );
     const totalFiles = parseInt(fileCount.rows[0]?.count ?? "0", 10);
 
@@ -63,7 +73,8 @@ export async function GET() {
 
     // Get latest indexed timestamp
     const latestQuery = await pool.query<{ latest: string | null }>(
-      "SELECT MAX(metadata->>'indexed_at') as latest FROM file_index"
+      `SELECT MAX(metadata->>'indexed_at') as latest FROM file_index ${whereClause}`,
+      queryParams
     );
     const lastIndexedAt = latestQuery.rows[0]?.latest ?? null;
 
@@ -72,9 +83,11 @@ export async function GET() {
       `
         SELECT DISTINCT metadata->>'source' as source
         FROM file_index
+        ${whereClause}
         ORDER BY metadata->>'source'
         LIMIT 10
-      `
+      `,
+      queryParams
     );
     const sampleSources = sourcesQuery.rows.map((row) => row.source);
 

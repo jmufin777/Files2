@@ -103,6 +103,7 @@ type SavedFileMeta = {
 type SavedContext = {
   id: string;
   name: string;
+  secretKey: string; // Pro multi-user izolaci a sdílení
   sambaPath: string;
   autoSyncMinutes: number;
   extensions: string[];
@@ -1131,6 +1132,7 @@ export default function Home() {
   const searchAbortRef = useRef<AbortController | null>(null);
   const sambaCancelRef = useRef<AbortController | null>(null);
   const directoryInputRef = useRef<HTMLInputElement | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const voiceRecogRef = useRef<SpeechRecognitionInstance | null>(null);
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -1169,6 +1171,16 @@ export default function Home() {
     lastIndexedAt: string | null;
     readyForSearch: boolean;
   } | null>(null);
+  const [secretWord, setSecretWord] = useState<string>("");
+  const [secretWordCheckingStatus, setSecretWordCheckingStatus] = useState<string | null>(null);
+  const [showSecretWord, setShowSecretWord] = useState(true);
+  const [savedSecretWords, setSavedSecretWords] = useState<string[]>([]);
+  const [secretWordSettings, setSecretWordSettings] = useState<{
+    sambaPath: string;
+    extensions: string[];
+    lastIndexedAt?: string;
+  }>({ sambaPath: "", extensions: [] });
+  const [isDeletingSecretWord, setIsDeletingSecretWord] = useState(false);
 
 
 
@@ -1302,8 +1314,17 @@ export default function Home() {
     try {
       const raw = window.localStorage.getItem(CONTEXTS_STORAGE_KEY);
       if (!raw) return;
-      const parsed = JSON.parse(raw) as SavedContext[];
+      let parsed = JSON.parse(raw) as SavedContext[];
       if (Array.isArray(parsed)) {
+        // Migrace: přidej secretKey starým kontextům
+        parsed = parsed.map((ctx) =>
+          ctx.secretKey
+            ? ctx
+            : {
+                ...ctx,
+                secretKey: Math.random().toString(36).substring(2, 10).toUpperCase(),
+              }
+        );
         setSavedContexts(parsed);
         if (parsed.length > 0) {
           setActiveContextId((prev) => prev ?? parsed[0].id);
@@ -1522,11 +1543,17 @@ export default function Home() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!secretWord || secretWord.length < 5) {
+      setKnowledgeBase(null);
+      return;
+    }
+    
     let cancelled = false;
 
     const loadKB = async () => {
       try {
-        const res = await fetch("/api/knowledge-base/status");
+        const prefix = `${secretWord}:`;
+        const res = await fetch(`/api/knowledge-base/status?prefix=${encodeURIComponent(prefix)}`);
         const data = (await res.json()) as {
           initialized: boolean;
           totalFiles?: number;
@@ -1554,7 +1581,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [secretWord]);
 
   const chartData = useMemo(() => {
     const sourcePaths: string[] = [];
@@ -1855,6 +1882,15 @@ export default function Home() {
         setStatus(
           `✓ Nalezeno ${data.stats?.totalFiles} souborů (${data.stats?.totalSizeGB} GB)`
         );
+        
+        // Save sambaPath to settings for current secret word
+        if (secretWord && secretWord.length >= 5) {
+          setSecretWordSettings((prev) => ({
+            ...prev,
+            sambaPath: sambaPath.trim(),
+          }));
+        }
+        
         if (autoAddSamba) {
           await addSambaFilesToContext(files);
         }
@@ -2160,9 +2196,12 @@ export default function Home() {
       setStatus("Zadejte název kontextu.");
       return;
     }
+    // Vygeneruj tajné slovo (8 znaky, alphanumerické)
+    const secretKey = Math.random().toString(36).substring(2, 10).toUpperCase();
     const context: SavedContext = {
       id: generateUUID(),
       name,
+      secretKey,
       sambaPath: newContextSambaPath.trim(),
       autoSyncMinutes: 0,
       extensions: [],
@@ -2174,6 +2213,7 @@ export default function Home() {
     setActiveContextId(context.id);
     setNewContextName("");
     setNewContextSambaPath("");
+    setStatus(`✓ Kontext "${name}" vytvořen. Tajné slovo: ${secretKey}`);
   };
 
   const handleUpdateActiveContext = (patch: Partial<SavedContext>) => {
@@ -2208,157 +2248,51 @@ export default function Home() {
       setStatus("Vyberte kontext.");
       return;
     }
-    if (!activeContext.sambaPath.trim()) {
-      setStatus("Aktivní kontext nemá nastavenou Samba cestu.");
+    
+    if (fileContext.length === 0) {
+      setStatus("UI kontext je prázdný. Přidejte soubory do kontextu a pak je synchronizujte.");
       return;
     }
+    
     setStatus(`Synchronizuji kontext ${activeContext.name}...`);
-    setSyncProgress({ label: "Start", percent: 0 });
+    setSyncProgress({ label: "Příprava", percent: 0 });
     setIsSyncing(true);
+    
     try {
-      const sambaController = new AbortController();
-      const sambaTimeoutId = window.setTimeout(
-        () => sambaController.abort(),
-        REQUEST_TIMEOUT_MS * 3
-      );
-      let response: Response;
-      try {
-        response = await fetch("/api/samba", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            sambaPath: activeContext.sambaPath.trim(),
-            recursive: true,
-            maxFiles: 5000,
-            maxDepth: 30,
-            extensions: activeContext.extensions.length
-              ? activeContext.extensions
-              : undefined,
-          }),
-          signal: sambaController.signal,
-        });
-      } finally {
-        window.clearTimeout(sambaTimeoutId);
-      }
-      const data = (await response.json()) as {
-        files?: SambaEntry[];
-        stats?: SambaStats;
-        error?: string;
-      };
-      if (!response.ok) {
-        throw new Error(data.error ?? "Samba scan failed.");
-      }
-
-      // Populate the Samba panel so the user sees immediate results.
-      if (Array.isArray(data.files)) {
-        setSambaFiles(data.files);
-      }
-      if (data.stats) {
-        setSambaStats(data.stats);
-      }
-      const sambaFilesList = (data.files ?? []).filter(
-        (file) => file.type === "file"
-      );
-      if (sambaFilesList.length === 0) {
-        setStatus(
-          "Samba scan doběhl, ale nebyl nalezen žádný soubor k indexaci. " +
-            "Zkontrolujte přípony/filtr a jestli cesta neobsahuje jen adresáře."
-        );
-        setSyncProgress(null);
-        return;
-      }
-
-      const updatedFiles = { ...activeContext.files };
+      const contextPrefix = activeContext.secretKey && activeContext.id
+        ? `${activeContext.secretKey}:${activeContext.id}:`
+        : activeContext.secretKey
+          ? `${activeContext.secretKey}:`
+          : "";
       const filesToIndex: Array<{ name: string; content: string }> = [];
-
-      let unchangedCount = 0;
-      let extractedCount = 0;
-      let skippedBadExtractCount = 0;
-
-      for (let index = 0; index < sambaFilesList.length; index += 1) {
-        const file = sambaFilesList[index];
-        const meta = updatedFiles[file.path] ?? {};
-        const sameModified =
-          (meta.modified ?? "") === String(file.modified ?? "");
-        const sameSize =
-          Number(meta.size ?? -1) === Number(file.size ?? -2);
-        const unchanged = sameModified && sameSize;
-        if (unchanged) {
-          unchangedCount += 1;
-          continue;
-        }
-        setSyncProgress({
-          label: `${file.name} (${index + 1}/${sambaFilesList.length})`,
-          percent: Math.round(((index + 1) / sambaFilesList.length) * 100),
-        });
-        const extractController = new AbortController();
-        const extractTimeoutId = window.setTimeout(
-          () => extractController.abort(),
-          REQUEST_TIMEOUT_MS * 2
-        );
-        let extractResponse: Response;
-        try {
-          extractResponse = await fetch("/api/extract", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              filePath: file.path,
-              fileName: file.name,
-            }),
-            signal: extractController.signal,
-          });
-        } finally {
-          window.clearTimeout(extractTimeoutId);
-        }
-        const extractData = (await extractResponse.json()) as {
-          text?: string;
-          error?: string;
-        };
-        if (!extractResponse.ok || !extractData.text) {
-          skippedBadExtractCount += 1;
-          continue;
-        }
-        extractedCount += 1;
-        const hash = await computeHash(extractData.text);
-        if (meta.hash && meta.hash === hash) {
-          updatedFiles[file.path] = {
-            modified: file.modified,
-            created: file.created,
-            size: file.size,
-            hash,
-          };
-          continue;
-        }
+      
+      // Vezmeme soubory z UI kontextu a přidáme je do indexu s prefixem kontextu
+      for (let i = 0; i < fileContext.length; i += 1) {
+        const file = fileContext[i];
         filesToIndex.push({
-          name: `${activeContext.id}:${file.path}`,
-          content: extractData.text,
+          name: `${contextPrefix}${file.path}`,
+          content: file.content,
         });
-        updatedFiles[file.path] = {
-          modified: file.modified,
-          created: file.created,
-          size: file.size,
-          hash,
-        };
+        
+        setSyncProgress({
+          label: `Příprava ${i + 1}/${fileContext.length}`,
+          percent: Math.round(((i + 1) / fileContext.length) * 50),
+        });
       }
-
+      
       if (filesToIndex.length === 0) {
-        setStatus(
-          `Žádné změny k indexaci. (přeskočeno beze změny: ${unchangedCount}, extrahováno: ${extractedCount}, selhalo extrahování: ${skippedBadExtractCount})`
-        );
+        setStatus("Žádné soubory k synchronizaci.");
         setSyncProgress(null);
-        handleUpdateActiveContext({
-          lastIndexedAt: new Date().toISOString(),
-          files: updatedFiles,
-        });
-        setIsIndexed(true);
         return;
       }
-
+      
       const indexController = new AbortController();
       const indexTimeoutId = window.setTimeout(
         () => indexController.abort(),
         REQUEST_TIMEOUT_MS * 4
       );
+      setSyncProgress({ label: "Indexace", percent: 75 });
+      
       let indexResponse: Response;
       try {
         indexResponse = await fetch("/api/index", {
@@ -2373,26 +2307,34 @@ export default function Home() {
       } finally {
         window.clearTimeout(indexTimeoutId);
       }
+      
       const indexData = (await indexResponse.json()) as {
         error?: string;
+        chunksCount?: number;
+        filesCount?: number;
         skippedFiles?: Array<{ name: string; reason: string }>;
-        skippedEmptyChunks?: number;
         embeddingDimension?: number;
       };
+      
       if (!indexResponse.ok) {
         throw new Error(indexData.error ?? "Indexing failed.");
       }
-
+      
+      setSyncProgress({ label: "Hotovo", percent: 100 });
+      setIsIndexed(true);
+      
       handleUpdateActiveContext({
         lastIndexedAt: new Date().toISOString(),
-        files: updatedFiles,
       });
-      setIsIndexed(true);
+      
       const skippedCount = indexData.skippedFiles?.length ?? 0;
+      const indexedFiles = Math.max(0, (indexData.filesCount ?? 0) - skippedCount);
       const skippedHint = skippedCount
-        ? ` (přeskočeno ${skippedCount} souborů; typicky prázdný/nevytěžený obsah)`
+        ? ` (přeskočeno ${skippedCount} souborů)`
         : "";
-      setStatus(`✓ Kontext ${activeContext.name} synchronizován.${skippedHint}`);
+      
+      setStatus(`✓ Kontext ${activeContext.name} synchronizován. Indexováno: ${indexedFiles} souborů → ${indexData.chunksCount} chunků${skippedHint}`);
+      
       if (activeContext.notifyOnSync && notificationsEnabled) {
         new Notification("Synchronizace hotová", {
           body: `Kontext ${activeContext.name} byl úspěšně synchronizován.`,
@@ -2551,6 +2493,147 @@ export default function Home() {
     return () => window.clearInterval(interval);
   }, [activeContext?.id, activeContext?.autoSyncMinutes]);
 
+  // Secret word validation and context auto-load/create
+  useEffect(() => {
+    if (secretWord.length < 5) {
+      setSecretWordCheckingStatus(null);
+      return;
+    }
+    
+    // For now, just validate that it's 5+ characters
+    // In the future, this could query DB to check if context exists
+    setSecretWordCheckingStatus(null);
+  }, [secretWord]);
+
+  // Load saved secret words from localStorage on mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const saved = localStorage.getItem("nai.savedSecretWords.v1");
+      if (saved) {
+        setSavedSecretWords(JSON.parse(saved));
+      }
+    } catch {
+      // Ignore localStorage errors
+    }
+  }, []);
+
+  // Save valid secret words to localStorage
+  useEffect(() => {
+    if (secretWord.length >= 5 && typeof window !== "undefined") {
+      try {
+        const updated = Array.from(new Set([secretWord, ...savedSecretWords])).slice(0, 20);
+        localStorage.setItem("nai.savedSecretWords.v1", JSON.stringify(updated));
+        setSavedSecretWords(updated);
+      } catch {
+        // Ignore localStorage errors
+      }
+    }
+  }, [secretWord]);
+
+  // Load settings for current secret word from localStorage
+  useEffect(() => {
+    if (secretWord.length < 5 || typeof window === "undefined") {
+      setSecretWordSettings({ sambaPath: "", extensions: [] });
+      return;
+    }
+    try {
+      const key = `nai.secretWordSettings.${secretWord}`;
+      const saved = localStorage.getItem(key);
+      if (saved) {
+        setSecretWordSettings(JSON.parse(saved));
+      } else {
+        setSecretWordSettings({ sambaPath: "", extensions: [] });
+      }
+    } catch {
+      setSecretWordSettings({ sambaPath: "", extensions: [] });
+    }
+  }, [secretWord]);
+
+  // Save settings for current secret word to localStorage
+  useEffect(() => {
+    if (secretWord.length < 5 || typeof window === "undefined") return;
+    try {
+      const key = `nai.secretWordSettings.${secretWord}`;
+      localStorage.setItem(key, JSON.stringify(secretWordSettings));
+    } catch {
+      // Ignore localStorage errors
+    }
+  }, [secretWord, secretWordSettings]);
+
+  // Auto-load sambaPath from settings when secret word changes
+  useEffect(() => {
+    if (secretWord.length >= 5 && secretWordSettings.sambaPath) {
+      setSambaPath(secretWordSettings.sambaPath);
+    }
+  }, [secretWord, secretWordSettings.sambaPath]);
+
+  const handleDeleteSecretWord = async () => {
+    if (!secretWord || secretWord.length < 5) return;
+    
+    const confirmed = window.confirm(
+      `Opravdu chcete smazat slovo "${secretWord}" a VŠECHNA zaindexovaná data z databáze? Tato akce je nevratná!`
+    );
+    if (!confirmed) return;
+
+    setIsDeletingSecretWord(true);
+    setStatus("Mažu data z databáze...");
+    
+    try {
+      const response = await fetch("/api/index/delete-by-prefix", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefix: `${secretWord}:` }),
+      });
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error ?? "Smazání dat selhalo.");
+      }
+
+      // Remove from localStorage
+      if (typeof window !== "undefined") {
+        try {
+          const key = `nai.secretWordSettings.${secretWord}`;
+          localStorage.removeItem(key);
+          
+          // Remove from saved words list
+          const updated = savedSecretWords.filter(w => w !== secretWord);
+          localStorage.setItem("nai.savedSecretWords.v1", JSON.stringify(updated));
+          setSavedSecretWords(updated);
+        } catch {
+          // Ignore localStorage errors
+        }
+      }
+
+      setSecretWord("");
+      setSecretWordSettings({ sambaPath: "", extensions: [] });
+      setFileContext([]);
+      setIsIndexed(false);
+      setStatus(`✓ Slovo "${secretWord}" a ${data.deletedCount ?? 0} záznamů bylo smazáno.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Smazání dat selhalo.");
+    } finally {
+      setIsDeletingSecretWord(false);
+    }
+  };
+
+  const handleRemoveSavedWord = (wordToRemove: string) => {
+    if (typeof window === "undefined") return;
+    try {
+      const updated = savedSecretWords.filter(w => w !== wordToRemove);
+      localStorage.setItem("nai.savedSecretWords.v1", JSON.stringify(updated));
+      setSavedSecretWords(updated);
+      
+      // Also remove settings
+      const key = `nai.secretWordSettings.${wordToRemove}`;
+      localStorage.removeItem(key);
+    } catch {
+      // Ignore localStorage errors
+    }
+  };
+
   const handleEnableNotifications = async () => {
     if (typeof window === "undefined" || !("Notification" in window)) {
       setStatus("Notifikace nejsou v tomto prohlížeči podporovány.");
@@ -2572,6 +2655,10 @@ export default function Home() {
   };
 
   const handleIndexFiles = async () => {
+    if (!secretWord || secretWord.length < 5) {
+      setStatus("Zadejte platné přístupové slovo (min. 5 znaků) pro indexaci.");
+      return;
+    }
     if (fileContext.length === 0) {
       setStatus("Add files to context first.");
       return;
@@ -2580,7 +2667,7 @@ export default function Home() {
     setStatus("Indexing files...");
     setIndexProgress({ label: "Příprava", percent: 0 });
     try {
-      const contextPrefix = activeContext?.id ? `${activeContext.id}:` : "";
+      const contextPrefix = secretWord ? `${secretWord}:` : "";
       const filesPayload = fileContext.map((f, index) => {
         const percent = Math.round(((index + 1) / fileContext.length) * 50);
         setIndexProgress({
@@ -2636,6 +2723,33 @@ export default function Home() {
       setStatus(
         `✓ Indexed ${indexedFiles}/${data.filesCount} souborů → ${data.chunksCount} chunků${skippedSuffix}${dimSuffix}`
       );
+      
+      // Update lastIndexedAt in settings
+      setSecretWordSettings((prev) => ({
+        ...prev,
+        lastIndexedAt: new Date().toISOString(),
+      }));
+      
+      // Refresh Knowledge Base status
+      if (secretWord && secretWord.length >= 5) {
+        try {
+          const prefix = `${secretWord}:`;
+          const kbRes = await fetch(`/api/knowledge-base/status?prefix=${encodeURIComponent(prefix)}`);
+          const kbData = await kbRes.json();
+          if (kbRes.ok) {
+            setKnowledgeBase({
+              initialized: kbData.initialized ?? false,
+              totalFiles: kbData.totalFiles ?? 0,
+              totalChunks: kbData.totalChunks ?? 0,
+              embeddingDimension: kbData.embeddingDimension ?? null,
+              lastIndexedAt: kbData.lastIndexedAt ?? null,
+              readyForSearch: kbData.readyForSearch ?? false,
+            });
+          }
+        } catch {
+          // Ignore KB refresh errors
+        }
+      }
     } catch (error) {
       setStatus(
         error instanceof Error ? error.message : "Indexing failed."
@@ -2698,15 +2812,56 @@ export default function Home() {
           trimmed
         );
 
-      if (asksWhatDataWeHave && fileContext.length === 0 && hasDbIndex) {
+      if (asksWhatDataWeHave) {
+        if (fileContext.length > 0) {
+          const extensionCounts = new Map<string, number>();
+          for (const file of fileContext) {
+            const ext = getExtension(file.path);
+            extensionCounts.set(ext, (extensionCounts.get(ext) ?? 0) + 1);
+          }
+          const extensionSummary = Array.from(extensionCounts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([ext, count]) => `${ext}: ${count}`)
+            .join(", ");
+          const sampleLimit = 10;
+          const sampleList = fileContext
+            .slice(0, sampleLimit)
+            .map((file) => `- ${file.path}`)
+            .join("\n");
+          const remaining = Math.max(0, fileContext.length - sampleLimit);
+          const suffix = remaining > 0 ? `\n... a dalších ${remaining} souborů` : "";
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                `V UI kontextu mám ${fileContext.length} souborů. Typy: ${extensionSummary || "(nezjištěno)"}.\n\nUkázka souborů:\n${sampleList}${suffix}`,
+            },
+          ]);
+          return;
+        }
+
+        if (hasDbIndex) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text:
+                "UI kontext je teď prázdný (nemám v prohlížeči načtené texty souborů), ale data jsou zaindexovaná v databázi. " +
+                "Můžeme tedy pracovat přes vyhledávání nad DB (RAG) – ptejte se normálně na obsah datasetu. " +
+                "Pokud chcete lokální výpočty nad CSV (řádky, agregace po měsících apod.), použijte tlačítko „Načíst do UI kontextu“.",
+            },
+          ]);
+          return;
+        }
+
         setMessages((prev) => [
           ...prev,
           {
             role: "assistant",
             text:
-              "UI kontext je teď prázdný (nemám v prohlížeči načtené texty souborů), ale data jsou zaindexovaná v databázi. " +
-              "Můžeme tedy pracovat přes vyhledávání nad DB (RAG) – ptejte se normálně na obsah datasetu. " +
-              "Pokud chcete lokální výpočty nad CSV (řádky, agregace po měsících apod.), použijte tlačítko „Načíst do UI kontextu“.",
+              "UI kontext je teď prázdný. Přidejte soubory do kontextu a pak můžu shrnout, co v nich je.",
           },
         ]);
         return;
@@ -2736,7 +2891,7 @@ export default function Home() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              contextId: activeContext?.id ?? undefined,
+              secretWord: secretWord || undefined,
             }),
           });
           const data = (await response.json()) as {
@@ -2888,7 +3043,7 @@ export default function Home() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              contextId: activeContext?.id ?? undefined,
+              secretWord: secretWord || undefined,
             }),
           });
           const data = (await response.json()) as {
@@ -3181,7 +3336,10 @@ export default function Home() {
       const endpoint = hasDbIndex ? "/api/search" : "/api/gemini";
       const body =
         hasDbIndex
-          ? JSON.stringify({ query: trimmed, contextId: activeContext?.id ?? undefined })
+          ? JSON.stringify({ 
+              query: trimmed, 
+              secretWord: secretWord || undefined
+            })
           : JSON.stringify({ message: trimmed, context: contextText });
 
       let response: Response;
@@ -3242,6 +3400,9 @@ export default function Home() {
     }
   };
 
+  // Check if Samba section should be shown (default: true if not set or set to "1")
+  const showSamba = process.env.NEXT_PUBLIC_SHOW_SAMBA !== "0";
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <main className="mx-auto flex w-full max-w-[1600px] flex-col gap-10 px-6 py-12">
@@ -3259,7 +3420,212 @@ export default function Home() {
           </p>
         </header>
 
-        <section className="grid gap-6 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
+        {/* Secret Word Input Section */}
+        <section className="grid gap-4 rounded-3xl border border-emerald-700 bg-emerald-900/40 p-6">
+          <div className="flex flex-col gap-3">
+            <h3 className="text-lg font-semibold text-emerald-100">
+              Přístupové slovo 🔐
+            </h3>
+            <p className="text-sm text-emerald-200">
+              Zadejte min. 5 znaků. Bez slova nebudou ostatní funkcionalité dostupné.
+            </p>
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2 md:flex-row md:items-end">
+                <div className="flex-1 relative">
+                  <input
+                    type={showSecretWord ? "text" : "password"}
+                    placeholder="Zadejte přístupové slovo (min. 5 znaků)..."
+                    list="secret-words-list"
+                    autoComplete="off"
+                    className={`w-full rounded-2xl border px-4 py-3 pr-12 text-sm bg-slate-950 text-slate-100 placeholder-slate-500 ${
+                      secretWord.length > 0 && secretWord.length < 5
+                        ? "border-red-600"
+                        : secretWord.length >= 5
+                          ? "border-emerald-600"
+                          : "border-slate-700"
+                    }`}
+                    value={secretWord}
+                    onChange={(e) => setSecretWord(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && secretWord.length >= 5) {
+                        // Could trigger context check/creation
+                      }
+                    }}
+                  />
+                  <datalist id="secret-words-list">
+                    {savedSecretWords
+                      .filter((word) => word !== secretWord)
+                      .map((word) => (
+                        <option key={word} value={word} />
+                      ))}
+                  </datalist>
+                  <button
+                    type="button"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 transition"
+                    onClick={() => setShowSecretWord(!showSecretWord)}
+                    title={showSecretWord ? "Skrýt slovo" : "Zobrazit slovo"}
+                  >
+                    {showSecretWord ? "👁️" : "👁️‍🗨️"}
+                  </button>
+                </div>
+                {secretWord.length >= 5 && (
+                  <div className="text-sm text-emerald-300 font-semibold">
+                    ✓ Slovo je platné
+                  </div>
+                )}
+              </div>
+
+              {secretWord.length > 0 && secretWord.length < 5 && (
+                <p className="text-sm text-red-300">
+                  Slovo musí mít minimálně 5 znaků.
+                </p>
+              )}
+              {secretWordCheckingStatus && (
+                <p className="text-sm text-amber-300">{secretWordCheckingStatus}</p>
+              )}
+              
+              {/* Saved Words Management */}
+              {savedSecretWords.length > 0 && (
+                <div className="rounded-2xl border border-slate-700 bg-slate-900/40 p-3">
+                  <p className="text-xs text-slate-400 mb-2">Uložená slova (klikněte pro výběr, ✕ pro smazání):</p>
+                  <div className="flex flex-wrap gap-2">
+                    {savedSecretWords.map((word) => (
+                      <div
+                        key={word}
+                        className={`group flex items-center gap-2 rounded-xl border px-3 py-1.5 text-xs transition ${
+                          word === secretWord
+                            ? "border-emerald-600 bg-emerald-900/30 text-emerald-200"
+                            : "border-slate-700 bg-slate-800/50 text-slate-300 hover:border-slate-600 hover:bg-slate-800 cursor-pointer"
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          className="font-mono"
+                          onClick={() => setSecretWord(word)}
+                          disabled={word === secretWord}
+                        >
+                          {word}
+                        </button>
+                        {word !== secretWord && (
+                          <button
+                            type="button"
+                            className="text-slate-500 hover:text-red-400 transition opacity-0 group-hover:opacity-100"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleRemoveSavedWord(word);
+                            }}
+                            title="Odstranit z historie"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* Secret Word Settings Section */}
+        {secretWord.length >= 5 && (
+        <section className="grid gap-4 rounded-3xl border border-slate-700 bg-slate-900/60 p-6">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold text-slate-200">
+              Nastavení pro "{secretWord}"
+            </h3>
+            <button
+              className="rounded-2xl border border-red-600 bg-red-900/30 px-4 py-2 text-sm font-semibold text-red-200 hover:bg-red-900/50 transition disabled:opacity-50"
+              onClick={handleDeleteSecretWord}
+              disabled={isDeletingSecretWord}
+            >
+              {isDeletingSecretWord ? "Mažu..." : <>🗑️ Smazat slovo <strong>{secretWord}</strong> a data</>}
+            </button>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="flex flex-col gap-2">
+              <label className="text-xs text-slate-400">Samba cesta (volitelné)</label>
+              <input
+                className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
+                placeholder="/mnt/samba nebo //server/share"
+                value={secretWordSettings.sambaPath}
+                onChange={(e) =>
+                  setSecretWordSettings((prev) => ({ ...prev, sambaPath: e.target.value }))
+                }
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-xs text-slate-400">Filtry přípon (čárkou oddělené)</label>
+              <input
+                className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
+                placeholder="pdf, xlsx, docx"
+                value={secretWordSettings.extensions.join(", ")}
+                onChange={(e) =>
+                  setSecretWordSettings((prev) => ({
+                    ...prev,
+                    extensions: e.target.value
+                      .split(",")
+                      .map((ext) => ext.trim())
+                      .filter((ext) => ext.length > 0),
+                  }))
+                }
+              />
+            </div>
+          </div>
+
+          {/* Knowledge Base Status */}
+          {knowledgeBase?.initialized && (
+            <div className="rounded-2xl border border-emerald-700 bg-emerald-900/20 p-4">
+              <h4 className="text-sm font-semibold text-emerald-200 mb-2">
+                📚 Knowledge Base - Zaindexovaná data
+              </h4>
+              <div className="grid gap-2 md:grid-cols-4">
+                <div className="text-xs">
+                  <span className="text-slate-400">Soubory:</span>
+                  <span className="ml-2 font-semibold text-emerald-300">{knowledgeBase.totalFiles}</span>
+                </div>
+                <div className="text-xs">
+                  <span className="text-slate-400">Chunks:</span>
+                  <span className="ml-2 font-semibold text-emerald-300">{knowledgeBase.totalChunks}</span>
+                </div>
+                <div className="text-xs">
+                  <span className="text-slate-400">Dimenze:</span>
+                  <span className="ml-2 font-semibold text-emerald-300">{knowledgeBase.embeddingDimension}D</span>
+                </div>
+                <div className="text-xs">
+                  {knowledgeBase.lastIndexedAt && (
+                    <>
+                      <span className="text-slate-400">Poslední indexace:</span>
+                      <span className="ml-2 font-semibold text-emerald-300">
+                        {new Date(knowledgeBase.lastIndexedAt).toLocaleString()}
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+              {knowledgeBase.readyForSearch && (
+                <p className="mt-2 text-xs text-emerald-400 font-medium">✓ Připraveno k vyhledávání</p>
+              )}
+            </div>
+          )}
+
+          {secretWordSettings.lastIndexedAt && (
+            <p className="text-xs text-slate-500">
+              Naposledy indexováno: {new Date(secretWordSettings.lastIndexedAt).toLocaleString()}
+            </p>
+          )}
+        </section>
+        )}
+
+        {/* File Selection Section */}
+        {secretWord.length >= 5 && (
+        <section className="grid gap-6 rounded-3xl border-2 border-blue-800 bg-slate-900/80 p-6">
+          <div className="flex items-center justify-between border-b border-blue-700 pb-4 mb-2">
+            <h2 className="text-xl font-bold text-blue-200">📁 Výběr souborů</h2>
+            <p className="text-xs text-slate-400">Pro slovo: <span className="font-mono text-blue-300">{secretWord}</span></p>
+          </div>
           <div className="flex flex-wrap items-center gap-3">
             <button
               className="rounded-full bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-900"
@@ -3285,6 +3651,7 @@ export default function Home() {
             </div>
           </div>
 
+          {showSamba && (
           <div className="flex flex-col gap-3 rounded-2xl border border-slate-700 bg-slate-900/40 p-4">
             <h3 className="text-sm font-semibold text-slate-200">
               Nebo připojte Samba sdílení (pro dataset 300 GB+)
@@ -3467,189 +3834,7 @@ export default function Home() {
               <span className="text-slate-400">0 = vše</span>
             </label>
           </div>
-          <div className="flex flex-col gap-3 rounded-2xl border border-slate-700 bg-slate-900/40 p-4">
-            <h3 className="text-sm font-semibold text-slate-200">
-              Uložené kontexty (automatická indexace)
-            </h3>
-            <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
-              <input
-                className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100 placeholder-slate-500"
-                placeholder="Název nového kontextu (např. Vyplaty)"
-                value={newContextName}
-                onChange={(event) => setNewContextName(event.target.value)}
-              />
-              <input
-                className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100 placeholder-slate-500"
-                placeholder="Samba path pro kontext"
-                value={newContextSambaPath}
-                onChange={(event) => setNewContextSambaPath(event.target.value)}
-              />
-              <button
-                className="rounded-2xl border border-slate-700 px-4 py-2 text-sm font-semibold"
-                onClick={handleCreateContext}
-              >
-                Přidat
-              </button>
-            </div>
-            {savedContexts.length > 0 ? (
-              <div className="grid gap-2 md:grid-cols-[1fr_auto_auto]">
-                <select
-                  className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
-                  value={activeContextId ?? ""}
-                  onChange={(event) =>
-                    setActiveContextId(event.target.value || null)
-                  }
-                >
-                  {savedContexts.map((ctx) => (
-                    <option key={ctx.id} value={ctx.id}>
-                      {ctx.name}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
-                  placeholder="Samba path"
-                  value={activeContext?.sambaPath ?? ""}
-                  onChange={(event) =>
-                    handleUpdateActiveContext({
-                      sambaPath: event.target.value,
-                    })
-                  }
-                />
-                <button
-                  className="rounded-2xl border border-slate-700 px-4 py-2 text-sm"
-                  type="button"
-                  onClick={handleSyncActiveContext}
-                  disabled={!activeContext || isSyncing}
-                >
-                  {isSyncing ? "Syncing..." : "Sync now"}
-                </button>
-              </div>
-            ) : (
-              <p className="text-xs text-slate-500">
-                Zatím nemáte uložený kontext.
-              </p>
-            )}
-            {activeContext && (
-              <div className="grid gap-2 md:grid-cols-[1fr_auto_auto_auto]">
-                <input
-                  className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
-                  placeholder="Přejmenovat kontext"
-                  value={activeContext.name}
-                  onChange={(event) =>
-                    handleUpdateActiveContext({ name: event.target.value })
-                  }
-                />
-                <input
-                  className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
-                  placeholder="Filtr přípon (např. pdf, xlsx)"
-                  value={activeContext.extensions.join(", ")}
-                  onChange={(event) =>
-                    handleUpdateActiveContext({
-                      extensions: event.target.value
-                        .split(",")
-                        .map((ext) => ext.trim())
-                        .filter((ext) => ext.length > 0),
-                    })
-                  }
-                />
-                <div className="flex items-center gap-2 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
-                  <span>Auto sync (min)</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={1440}
-                    className="w-20 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
-                    value={activeContext.autoSyncMinutes}
-                    onChange={(event) =>
-                      handleUpdateActiveContext({
-                        autoSyncMinutes: Math.max(
-                          0,
-                          Number(event.target.value) || 0
-                        ),
-                      })
-                    }
-                  />
-                </div>
-              </div>
-            )}
-            {activeContext && (
-              <div className="grid gap-2 md:grid-cols-[auto_auto_auto_1fr] items-center">
-                <label className="flex items-center gap-2 text-xs text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={activeContext.notifyOnSync}
-                    onChange={(event) =>
-                      handleUpdateActiveContext({
-                        notifyOnSync: event.target.checked,
-                      })
-                    }
-                  />
-                  Notifikace po syncu
-                </label>
-                <button
-                  className="rounded-2xl border border-slate-700 px-3 py-2 text-xs"
-                  onClick={handleEnableNotifications}
-                >
-                  Povolit notifikace
-                </button>
-                <button
-                  className="rounded-2xl border border-slate-700 px-4 py-2 text-sm text-rose-300"
-                  onClick={handleDeleteActiveContext}
-                >
-                  Smazat
-                </button>
-                <div className="flex flex-wrap items-center gap-2 justify-end">
-                  <label className="flex items-center gap-2 text-xs text-slate-300">
-                    <span>Load limit</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={5000}
-                      className="w-24 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
-                      value={uiLoadLimit}
-                      onChange={(e) =>
-                        setUiLoadLimit(Math.max(1, Number(e.target.value) || 1))
-                      }
-                    />
-                  </label>
-                  <label className="flex items-center gap-2 text-xs text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={uiLoadCacheOnly}
-                      onChange={(e) => setUiLoadCacheOnly(e.target.checked)}
-                    />
-                    Jen z cache
-                  </label>
-                  <button
-                    className="rounded-2xl border border-slate-700 px-3 py-2 text-xs"
-                    type="button"
-                    onClick={handleSaveUiContextToActiveContext}
-                    disabled={!activeContext}
-                    title="Uloží seznam aktuálních souborů v UI kontextu do vybraného uloženého kontextu (jen cesty)."
-                  >
-                    Uložit UI kontext
-                  </button>
-                  <button
-                    className="rounded-2xl border border-slate-700 px-3 py-2 text-xs"
-                    type="button"
-                    onClick={handleLoadUiContextFromActiveContext}
-                    disabled={!activeContext}
-                    title="Načte soubory do UI kontextu. Primárně z IndexedDB cache; volitelně umí doextrahovat chybějící."
-                  >
-                    Načíst do UI kontextu
-                  </button>
-                </div>
-                <div className="text-xs text-slate-500">
-                  {activeContext.lastIndexedAt
-                    ? `Naposledy: ${new Date(
-                        activeContext.lastIndexedAt
-                      ).toLocaleString()}`
-                    : "Zatím neindexováno"}
-                </div>
-              </div>
-            )}
-          </div>
+          )}
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1 text-[11px] text-slate-500">
               <span>Syntaxe: čárkou, <code className="bg-slate-800 px-1 rounded">!</code> = vyloučit, <code className="bg-slate-800 px-1 rounded">*</code> = vše. Př.: <code className="bg-slate-800 px-1 rounded">*, !eon</code> nebo <code className="bg-slate-800 px-1 rounded">docx, smlouva, !archiv</code></span>
@@ -3954,37 +4139,6 @@ export default function Home() {
                 Vymazat kontext
               </button>
 
-              {knowledgeBase?.initialized && (
-                <div className="rounded-2xl border border-slate-700 bg-slate-900/50 p-4">
-                  <h3 className="text-sm font-semibold text-slate-200">
-                    Knowledge Base
-                  </h3>
-                  <div className="mt-2 space-y-1 text-xs text-slate-400">
-                    <p>
-                      <span className="font-medium">Soubory:</span>{" "}
-                      {knowledgeBase.totalFiles}
-                    </p>
-                    <p>
-                      <span className="font-medium">Chunks:</span>{" "}
-                      {knowledgeBase.totalChunks}
-                    </p>
-                    <p>
-                      <span className="font-medium">Dimenze:</span>{" "}
-                      {knowledgeBase.embeddingDimension}D
-                    </p>
-                    {knowledgeBase.lastIndexedAt && (
-                      <p>
-                        <span className="font-medium">Poslední indexace:</span>{" "}
-                        {new Date(knowledgeBase.lastIndexedAt).toLocaleString()}
-                      </p>
-                    )}
-                    {knowledgeBase.readyForSearch && (
-                      <p className="text-emerald-400 font-medium">Pripraveno k vyhledavani</p>
-                    )}
-                  </div>
-                </div>
-              )}
-
               <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
                 <h3 className="text-sm font-semibold text-slate-200">
                   Kontext ({fileContext.length})
@@ -4033,6 +4187,7 @@ export default function Home() {
             </div>
           </div>
         </section>
+        )}
 
         <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
           <div className="flex flex-wrap items-center gap-3 justify-between">
@@ -4181,9 +4336,14 @@ export default function Home() {
                     key={`${message.role}-${index}`}
                     className={
                       message.role === "user"
-                        ? "rounded-2xl bg-slate-800 px-4 py-3 text-sm"
-                        : "rounded-2xl bg-emerald-500/10 px-4 py-3 text-sm"
+                        ? "rounded-2xl bg-slate-800 px-4 py-3 text-sm cursor-pointer hover:bg-slate-700 transition"
+                        : "rounded-2xl bg-emerald-500/10 px-4 py-3 text-sm cursor-pointer hover:bg-emerald-500/20 transition"
                     }
+                    onDoubleClick={() => {
+                      setChatInput(message.text);
+                      chatInputRef.current?.focus();
+                    }}
+                    title="Dvojklik pro zkopírování do pole"
                   >
                     <p className="text-xs uppercase text-slate-400">
                       {message.role}
@@ -4196,6 +4356,7 @@ export default function Home() {
               </div>
               <div className="grid gap-3 md:grid-cols-[1fr_auto_auto]">
                 <textarea
+                  ref={chatInputRef}
                   className="min-h-[96px] w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-slate-100"
                   placeholder="Zeptejte se..."
                   value={chatInput}

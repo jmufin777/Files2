@@ -13,7 +13,7 @@ type OrdersByStateResult = {
 };
 
 type OrdersRequest = {
-  contextId?: string;
+  secretWord?: string;
   maxRows?: number;
 };
 
@@ -124,7 +124,7 @@ export async function POST(request: Request) {
   const pool = new Pool({ connectionString: databaseUrl });
 
   try {
-    const like = payload.contextId ? `${payload.contextId}:%` : null;
+    const like = payload.secretWord ? `${payload.secretWord}:%` : null;
     const whereClause = like ? "WHERE metadata->>'source' LIKE $1" : "";
     const batchSize = 1000;
     let offset = 0;

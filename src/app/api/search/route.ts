@@ -13,7 +13,7 @@ type SearchRequest = {
   query: string;
   topK?: number;
   useAllDocuments?: boolean; // Pokud true, načte všechny dokumenty místo similarity search
-  contextId?: string; // Filter podle contextId (např. "samba_abc")
+  secretWord?: string; // Tajné slovo pro multi-user izolaci
   maxContextChunks?: number; // Maximální počet chunků poslaných do Gemini (kvůli rate limitu)
   analyzeOnly?: boolean; // Pokud true, vrátí jen statistiky bez volání Gemini
 };
@@ -172,9 +172,10 @@ export async function POST(request: Request) {
       let sqlQuery = `SELECT content AS pageContent, metadata FROM ${VECTOR_TABLE_NAME}`;
       const params: any[] = [];
       
-      if (payload.contextId) {
+      if (payload.secretWord) {
+        const prefix = `${payload.secretWord}:%`;
         sqlQuery += " WHERE metadata->>'source' LIKE $1";
-        params.push(`${payload.contextId}:%`);
+        params.push(prefix);
       }
       
       sqlQuery += " LIMIT 10000"; // Safety limit
@@ -211,7 +212,7 @@ export async function POST(request: Request) {
       )) as Array<{ pageContent: string; metadata: { source: string; [key: string]: any } }>;
     }
 
-    const contextPrefix = payload.contextId ? `${payload.contextId}:` : null;
+    const contextPrefix = payload.secretWord ? `${payload.secretWord}:` : null;
     if (contextPrefix) {
       results = results.filter(
         (row) =>

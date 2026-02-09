@@ -124,10 +124,13 @@ export async function POST(request: Request) {
               const fullPath = join(parentPath, entry);
               try {
                 const stat = statSync(fullPath);
-                suggestedPaths.push({
-                  path: fullPath,
-                  name: entry,
-                });
+                // Only suggest directories for wildcard paths
+                if (stat.isDirectory()) {
+                  suggestedPaths.push({
+                    path: fullPath,
+                    name: entry,
+                  });
+                }
               } catch {
                 // skip
               }
@@ -178,10 +181,13 @@ export async function POST(request: Request) {
                 const fullPath = join(parentPath, entry);
                 try {
                   const stat = statSync(fullPath);
-                  suggestedPaths.push({
-                    path: fullPath,
-                    name: entry,
-                  });
+                  // Only suggest directories for prefix matching
+                  if (stat.isDirectory()) {
+                    suggestedPaths.push({
+                      path: fullPath,
+                      name: entry,
+                    });
+                  }
                 } catch {
                   // skip
                 }
