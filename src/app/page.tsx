@@ -75,7 +75,7 @@ type StructuredResult = {
   summary?: string;
 };
 
-type ActiveTab = "chat" | "results";
+type ActiveTab = "chat" | "results" | "files";
 
 type ChartType = "pie" | "bar" | "line";
 type ChartSource = "results" | "samba";
@@ -1151,6 +1151,7 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [structuredResult, setStructuredResult] = useState<StructuredResult | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("chat");
+  const [lastSearchSources, setLastSearchSources] = useState<string[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [isIndexing, setIsIndexing] = useState(false);
   const [isRebuilding, setIsRebuilding] = useState(false);
@@ -3491,9 +3492,20 @@ export default function Home() {
       } finally {
         window.clearTimeout(timeoutId);
       }
-      const data = (await response.json()) as { text?: string; error?: string };
+      const data = (await response.json()) as {
+        text?: string;
+        error?: string;
+        sources?: string[];
+        relevantChunks?: number;
+        chunksUsedInPrompt?: number;
+      };
       if (!response.ok) {
         throw new Error(data.error ?? "Request failed.");
+      }
+
+      if (Array.isArray(data.sources)) {
+        const unique = Array.from(new Set(data.sources.map((s) => String(s)).filter(Boolean)));
+        setLastSearchSources(unique);
       }
       let processedText = data.text ?? "";
       
@@ -3540,6 +3552,29 @@ export default function Home() {
 
   // Check if Samba section should be shown (default: true if not set or set to "1")
   const showSamba = process.env.NEXT_PUBLIC_SHOW_SAMBA !== "0";
+
+  const assistantAllFiles = useMemo(() => {
+    const seen = new Set<string>();
+    const items: Array<{ path: string; description?: string }> = [];
+    if (structuredResult) {
+      for (const group of structuredResult.groups) {
+        for (const f of group.files) {
+          const p = String(f.path ?? "").trim();
+          if (!p || seen.has(p)) continue;
+          seen.add(p);
+          items.push({ path: p, description: f.description });
+        }
+      }
+      return items;
+    }
+    for (const src of lastSearchSources) {
+      const p = String(src ?? "").trim();
+      if (!p || seen.has(p)) continue;
+      seen.add(p);
+      items.push({ path: p });
+    }
+    return items;
+  }, [structuredResult, lastSearchSources]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -4481,6 +4516,21 @@ export default function Home() {
                   </span>
                 )}
               </button>
+              <button
+                className={`px-4 py-2 rounded-xl text-sm font-semibold transition ${
+                  activeTab === "files"
+                    ? "bg-emerald-400 text-slate-900"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+                onClick={() => setActiveTab("files")}
+              >
+                Soubory
+                {assistantAllFiles.length > 0 && (
+                  <span className="ml-2 bg-emerald-500 text-slate-900 rounded-full px-2 py-0.5 text-xs">
+                    {assistantAllFiles.length}
+                  </span>
+                )}
+              </button>
             </div>
           </div>
 
@@ -4680,6 +4730,76 @@ export default function Home() {
                 <p className="text-sm text-slate-500">
                   Zatím žádné strukturované výsledky. Zeptejte se v chatu například: 
                   "Mám klienta Colonnade a Helvetia, zkus mi dohledat co ke komu patří"
+                </p>
+              )}
+            </div>
+          )}
+
+          {activeTab === "files" && (
+            <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+              {assistantAllFiles.length > 0 ? (
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm text-slate-300">
+                      Zobrazuji {assistantAllFiles.length} unikátních souborů
+                      {structuredResult ? " (ze strukturovaných výsledků)" : lastSearchSources.length > 0 ? " (z posledního vyhledávání)" : ""}.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="rounded-xl bg-emerald-500 hover:bg-emerald-600 px-4 py-2 text-sm font-semibold text-slate-900 transition"
+                        onClick={() => {
+                          const allPaths = assistantAllFiles.map((x) => x.path);
+                          setSelectedPaths(new Set(allPaths));
+                          setStatus(`Vybráno ${allPaths.length} souborů`);
+                        }}
+                      >
+                        Vybrat všechny
+                      </button>
+                      {!structuredResult && lastSearchSources.length > 0 && (
+                        <button
+                          className="rounded-xl bg-slate-700 hover:bg-slate-600 px-4 py-2 text-sm font-semibold text-slate-100 transition"
+                          onClick={() => setLastSearchSources([])}
+                        >
+                          Vymazat seznam
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-slate-700">
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium">#</th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Soubor</th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Popis</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {assistantAllFiles.map((file, idx) => (
+                          <tr key={`${file.path}-${idx}`} className="border-b border-slate-800 hover:bg-slate-900/50">
+                            <td className="py-2 px-3 text-slate-400">{idx + 1}</td>
+                            <td className="py-2 px-3">
+                              <a
+                                className="text-emerald-400 hover:text-emerald-300 hover:underline text-left break-all"
+                                href={`/api/download?path=${encodeURIComponent(file.path)}`}
+                                title="Stáhnout soubor"
+                              >
+                                {file.path.split("/").pop() || file.path}
+                              </a>
+                              <div className="text-xs text-slate-500 mt-1">{file.path}</div>
+                            </td>
+                            <td className="py-2 px-3 text-slate-300">{file.description || "-"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">
+                  Zatím tu nemám seznam souborů. Nejdřív získejte strukturované výsledky (záložka „Strukturované výsledky“),
+                  nebo spusťte dotaz přes DB index (pak se sem uloží zdroje z posledního vyhledávání).
                 </p>
               )}
             </div>
