@@ -212,7 +212,13 @@ export async function POST(request: Request) {
     // Process all files and create documents
     const documents: Array<{
       pageContent: string;
-      metadata: { source: string; indexed_at: string; file_hash: string };
+      metadata: {
+        source: string;
+        indexed_at: string;
+        file_hash: string;
+        line_count?: number;
+        file_size?: number;
+      };
     }> = [];
     const skippedFiles: Array<{ name: string; reason: string }> = [];
     let totalChunks = 0;
@@ -318,6 +324,9 @@ export async function POST(request: Request) {
         totalChunks += chunks.length;
 
         const indexedAt = new Date().toISOString();
+        const lineCount = file.content.split('\n').length;
+        const fileSize = file.content.length;
+        
         let fileHasAnyChunk = false;
         for (const chunk of chunks) {
           const trimmedChunk = chunk.trim();
@@ -332,6 +341,8 @@ export async function POST(request: Request) {
               source: file.name,
               indexed_at: indexedAt,
               file_hash: file.fileHash,
+              line_count: lineCount,
+              file_size: fileSize,
             },
           });
         }

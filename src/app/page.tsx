@@ -113,6 +113,29 @@ type SavedContext = {
   uiPaths?: string[];
 };
 
+type SecretWordLastSource = "files" | "samba";
+
+type SecretWordSettings = {
+  sambaPath: string;
+  extensions: string[];
+  lastIndexedAt?: string;
+  lastSource?: SecretWordLastSource;
+
+  // Samba / network parameters
+  sambaFilter: string;
+  sambaContentFilter: string;
+  sambaMaxDays: number;
+  autoAddSamba: boolean;
+  autoAddLimit: number;
+
+  // Local "Soubory" search parameters
+  query: string;
+  contentQuery: string;
+  folderMaxDays: number;
+  searchMode: "and" | "or";
+  ocrMaxPages: number;
+};
+
 type IndexStatusResponse = {
   tableExists?: boolean;
   hasAnyIndex?: boolean;
@@ -130,6 +153,23 @@ const DEFAULT_OCR_MAX_PAGES = 5;
 const OCR_BATCH_SIZE = 5;
 const CONTEXTS_STORAGE_KEY = "nai.savedContexts.v1";
 const FILTERS_STORAGE_KEY = "nai.filters.v1";
+
+const DEFAULT_SECRET_WORD_SETTINGS: SecretWordSettings = {
+  sambaPath: "",
+  extensions: [],
+  lastIndexedAt: undefined,
+  lastSource: undefined,
+  sambaFilter: "",
+  sambaContentFilter: "",
+  sambaMaxDays: 0,
+  autoAddSamba: false,
+  autoAddLimit: 0,
+  query: "",
+  contentQuery: "",
+  folderMaxDays: 0,
+  searchMode: "and",
+  ocrMaxPages: DEFAULT_OCR_MAX_PAGES,
+};
 
 type CachedTextRecord = {
   path: string;
@@ -1175,12 +1215,137 @@ export default function Home() {
   const [secretWordCheckingStatus, setSecretWordCheckingStatus] = useState<string | null>(null);
   const [showSecretWord, setShowSecretWord] = useState(true);
   const [savedSecretWords, setSavedSecretWords] = useState<string[]>([]);
-  const [secretWordSettings, setSecretWordSettings] = useState<{
-    sambaPath: string;
-    extensions: string[];
-    lastIndexedAt?: string;
-  }>({ sambaPath: "", extensions: [] });
+  const [secretWordSettings, setSecretWordSettings] = useState<SecretWordSettings>(
+    DEFAULT_SECRET_WORD_SETTINGS
+  );
   const [isDeletingSecretWord, setIsDeletingSecretWord] = useState(false);
+
+  const loadSecretWordSettings = (word: string): SecretWordSettings => {
+    if (typeof window === "undefined" || word.length < 5) {
+      return DEFAULT_SECRET_WORD_SETTINGS;
+    }
+    try {
+      const key = `nai.secretWordSettings.${word}`;
+      const saved = window.localStorage.getItem(key);
+      if (!saved) return DEFAULT_SECRET_WORD_SETTINGS;
+      const parsed = JSON.parse(saved) as Partial<SecretWordSettings>;
+      return {
+        ...DEFAULT_SECRET_WORD_SETTINGS,
+        ...parsed,
+        extensions: Array.isArray(parsed.extensions)
+          ? parsed.extensions
+              .map((x) => String(x).trim())
+              .filter((x) => x.length > 0)
+          : [],
+        searchMode: parsed.searchMode === "or" ? "or" : "and",
+        ocrMaxPages:
+          typeof parsed.ocrMaxPages === "number" && parsed.ocrMaxPages > 0
+            ? Math.min(50, Math.max(1, parsed.ocrMaxPages))
+            : DEFAULT_OCR_MAX_PAGES,
+        sambaMaxDays:
+          typeof parsed.sambaMaxDays === "number" && parsed.sambaMaxDays >= 0
+            ? parsed.sambaMaxDays
+            : 0,
+        folderMaxDays:
+          typeof parsed.folderMaxDays === "number" && parsed.folderMaxDays >= 0
+            ? parsed.folderMaxDays
+            : 0,
+        autoAddLimit:
+          typeof parsed.autoAddLimit === "number" && parsed.autoAddLimit >= 0
+            ? parsed.autoAddLimit
+            : 0,
+        autoAddSamba: Boolean(parsed.autoAddSamba),
+        sambaFilter: typeof parsed.sambaFilter === "string" ? parsed.sambaFilter : "",
+        sambaContentFilter:
+          typeof parsed.sambaContentFilter === "string" ? parsed.sambaContentFilter : "",
+        query: typeof parsed.query === "string" ? parsed.query : "",
+        contentQuery: typeof parsed.contentQuery === "string" ? parsed.contentQuery : "",
+        sambaPath: typeof parsed.sambaPath === "string" ? parsed.sambaPath : "",
+      };
+    } catch {
+      return DEFAULT_SECRET_WORD_SETTINGS;
+    }
+  };
+
+  const applySecretWordToSambaForm = (word: string) => {
+    const merged = loadSecretWordSettings(word);
+    setSecretWord(word);
+    setSecretWordSettings(merged);
+
+    const nextPath = merged.sambaPath;
+    setSambaPath(nextPath);
+    setSambaFilter(merged.sambaFilter);
+    setSambaContentFilter(merged.sambaContentFilter);
+    setSambaMaxDays(Math.max(0, merged.sambaMaxDays));
+    setAutoAddSamba(Boolean(merged.autoAddSamba));
+    setAutoAddLimit(Math.max(0, merged.autoAddLimit));
+
+    if (nextPath.trim() !== lastScannedSambaPath) {
+      setSambaFiles([]);
+      setSambaStats(null);
+    }
+  };
+
+  const applySecretWordToFilesForm = (word: string) => {
+    const merged = loadSecretWordSettings(word);
+    setSecretWord(word);
+    setSecretWordSettings(merged);
+
+    setQuery(merged.query);
+    setContentQuery(merged.contentQuery);
+    setFolderMaxDays(Math.max(0, merged.folderMaxDays));
+    setSearchMode(merged.searchMode);
+    setOcrMaxPages(merged.ocrMaxPages);
+  };
+
+  const persistSecretWordSettings = (word: string, settings: SecretWordSettings) => {
+    if (typeof window === "undefined" || word.length < 5) return;
+    try {
+      const key = `nai.secretWordSettings.${word}`;
+      window.localStorage.setItem(key, JSON.stringify(settings));
+    } catch {
+      // ignore
+    }
+  };
+
+  const buildSettingsFromCurrentUi = (
+    patch?: Partial<SecretWordSettings>
+  ): SecretWordSettings => {
+    const inferredSource: SecretWordLastSource | undefined =
+      sambaPath.trim().length > 0
+        ? "samba"
+        : files.length > 0
+          ? "files"
+          : undefined;
+
+    return {
+      ...secretWordSettings,
+      ...patch,
+      lastSource: patch?.lastSource ?? inferredSource ?? secretWordSettings.lastSource,
+      sambaPath: sambaPath.trim(),
+      sambaFilter,
+      sambaContentFilter,
+      sambaMaxDays,
+      autoAddSamba,
+      autoAddLimit,
+      query: query.trimEnd(),
+      contentQuery: contentQuery.trimEnd(),
+      folderMaxDays,
+      searchMode,
+      ocrMaxPages,
+    };
+  };
+
+  const handleSaveSecretWordContext = () => {
+    if (!secretWord || secretWord.length < 5) {
+      setStatus("Zadejte platné přístupové slovo (min. 5 znaků)." );
+      return;
+    }
+    const next = buildSettingsFromCurrentUi();
+    setSecretWordSettings(next);
+    persistSecretWordSettings(secretWord, next);
+    setStatus(`✓ Uloženo nastavení pro "${secretWord}".`);
+  };
 
 
 
@@ -1683,6 +1848,7 @@ export default function Home() {
   const handleSearch = async () => {
     const nameInput = query.trim();
     const contentInput = contentQuery.trim();
+
     if (!nameInput && !contentInput) {
       setResults([]);
       return;
@@ -2534,39 +2700,11 @@ export default function Home() {
   // Load settings for current secret word from localStorage
   useEffect(() => {
     if (secretWord.length < 5 || typeof window === "undefined") {
-      setSecretWordSettings({ sambaPath: "", extensions: [] });
+      setSecretWordSettings(DEFAULT_SECRET_WORD_SETTINGS);
       return;
     }
-    try {
-      const key = `nai.secretWordSettings.${secretWord}`;
-      const saved = localStorage.getItem(key);
-      if (saved) {
-        setSecretWordSettings(JSON.parse(saved));
-      } else {
-        setSecretWordSettings({ sambaPath: "", extensions: [] });
-      }
-    } catch {
-      setSecretWordSettings({ sambaPath: "", extensions: [] });
-    }
+    setSecretWordSettings(loadSecretWordSettings(secretWord));
   }, [secretWord]);
-
-  // Save settings for current secret word to localStorage
-  useEffect(() => {
-    if (secretWord.length < 5 || typeof window === "undefined") return;
-    try {
-      const key = `nai.secretWordSettings.${secretWord}`;
-      localStorage.setItem(key, JSON.stringify(secretWordSettings));
-    } catch {
-      // Ignore localStorage errors
-    }
-  }, [secretWord, secretWordSettings]);
-
-  // Auto-load sambaPath from settings when secret word changes
-  useEffect(() => {
-    if (secretWord.length >= 5 && secretWordSettings.sambaPath) {
-      setSambaPath(secretWordSettings.sambaPath);
-    }
-  }, [secretWord, secretWordSettings.sambaPath]);
 
   const handleDeleteSecretWord = async () => {
     if (!secretWord || secretWord.length < 5) return;
@@ -2608,7 +2746,7 @@ export default function Home() {
       }
 
       setSecretWord("");
-      setSecretWordSettings({ sambaPath: "", extensions: [] });
+      setSecretWordSettings(DEFAULT_SECRET_WORD_SETTINGS);
       setFileContext([]);
       setIsIndexed(false);
       setStatus(`✓ Slovo "${secretWord}" a ${data.deletedCount ?? 0} záznamů bylo smazáno.`);
@@ -2725,10 +2863,10 @@ export default function Home() {
       );
       
       // Update lastIndexedAt in settings
-      setSecretWordSettings((prev) => ({
-        ...prev,
-        lastIndexedAt: new Date().toISOString(),
-      }));
+      const indexedAtIso = new Date().toISOString();
+      const nextSaved = buildSettingsFromCurrentUi({ lastIndexedAt: indexedAtIso });
+      setSecretWordSettings(nextSaved);
+      persistSecretWordSettings(secretWord, nextSaved);
       
       // Refresh Knowledge Base status
       if (secretWord && secretWord.length >= 5) {
@@ -3535,13 +3673,36 @@ export default function Home() {
             <h3 className="text-lg font-semibold text-slate-200">
               Nastavení pro "{secretWord}"
             </h3>
-            <button
-              className="rounded-2xl border border-red-600 bg-red-900/30 px-4 py-2 text-sm font-semibold text-red-200 hover:bg-red-900/50 transition disabled:opacity-50"
-              onClick={handleDeleteSecretWord}
-              disabled={isDeletingSecretWord}
-            >
-              {isDeletingSecretWord ? "Mažu..." : <>🗑️ Smazat slovo <strong>{secretWord}</strong> a data</>}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                className="rounded-2xl border border-slate-600 bg-slate-900/40 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900/60 transition"
+                onClick={() => applySecretWordToFilesForm(secretWord)}
+                title="Předvyplní formulář Soubory (bez spuštění hledání)"
+              >
+                Soubory
+              </button>
+              <button
+                className="rounded-2xl border border-slate-600 bg-slate-900/40 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900/60 transition"
+                onClick={() => applySecretWordToSambaForm(secretWord)}
+                title="Předvyplní formulář Samba (bez spuštění skenu)"
+              >
+                Samba
+              </button>
+              <button
+                className="rounded-2xl border border-emerald-700 bg-emerald-900/20 px-4 py-2 text-sm font-semibold text-emerald-200 hover:bg-emerald-900/35 transition"
+                onClick={handleSaveSecretWordContext}
+                title="Uloží aktuální hodnoty z formulářů (Samba/Soubory) pro toto slovo"
+              >
+                💾 Uložit
+              </button>
+              <button
+                className="rounded-2xl border border-red-600 bg-red-900/30 px-4 py-2 text-sm font-semibold text-red-200 hover:bg-red-900/50 transition disabled:opacity-50"
+                onClick={handleDeleteSecretWord}
+                disabled={isDeletingSecretWord}
+              >
+                {isDeletingSecretWord ? "Mažu..." : <>🗑️ Smazat slovo <strong>{secretWord}</strong> a data</>}
+              </button>
+            </div>
           </div>
 
           <div className="grid gap-3 md:grid-cols-2">
@@ -3551,9 +3712,10 @@ export default function Home() {
                 className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
                 placeholder="/mnt/samba nebo //server/share"
                 value={secretWordSettings.sambaPath}
-                onChange={(e) =>
-                  setSecretWordSettings((prev) => ({ ...prev, sambaPath: e.target.value }))
-                }
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setSecretWordSettings((prev) => ({ ...prev, sambaPath: next }));
+                }}
               />
             </div>
             <div className="flex flex-col gap-2">
@@ -3662,9 +3824,10 @@ export default function Home() {
                 placeholder="Samba path (e.g., /mnt/samba or //server/share)"
                 value={sambaPath}
                 onChange={(e) => {
-                  setSambaPath(e.target.value);
+                  const next = e.target.value;
+                  setSambaPath(next);
                   // Clear stale results when path differs from last scan
-                  if (e.target.value.trim() !== lastScannedSambaPath) {
+                  if (next.trim() !== lastScannedSambaPath) {
                     setSambaFiles([]);
                     setSambaStats(null);
                   }
@@ -3791,13 +3954,19 @@ export default function Home() {
                   className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100 placeholder-slate-500"
                   placeholder="Název souboru: docx, smlouva, !eon"
                   value={sambaFilter}
-                  onChange={(e) => setSambaFilter(e.target.value)}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setSambaFilter(next);
+                  }}
                 />
                 <input
                   className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100 placeholder-slate-500"
                   placeholder="Obsah souboru: faktura, !zrušeno"
                   value={sambaContentFilter}
-                  onChange={(e) => setSambaContentFilter(e.target.value)}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setSambaContentFilter(next);
+                  }}
                 />
                 <div className="flex items-center gap-1 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
                   <span className="whitespace-nowrap">Dny</span>
@@ -3806,7 +3975,10 @@ export default function Home() {
                     min={0}
                     className="w-16 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
                     value={sambaMaxDays}
-                    onChange={(e) => setSambaMaxDays(Math.max(0, Number(e.target.value) || 0))}
+                    onChange={(e) => {
+                      const next = Math.max(0, Number(e.target.value) || 0);
+                      setSambaMaxDays(next);
+                    }}
                     title="Změna za posledních X dní (0 = vše)"
                   />
                 </div>
@@ -3816,7 +3988,10 @@ export default function Home() {
               <input
                 type="checkbox"
                 checked={autoAddSamba}
-                onChange={(event) => setAutoAddSamba(event.target.checked)}
+                onChange={(event) => {
+                  const next = event.target.checked;
+                  setAutoAddSamba(next);
+                }}
               />
               Po skenu automaticky přidat soubory do kontextu
             </label>
@@ -3827,9 +4002,10 @@ export default function Home() {
                 min={0}
                 className="w-24 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
                 value={autoAddLimit}
-                onChange={(event) =>
-                  setAutoAddLimit(Math.max(0, Number(event.target.value) || 0))
-                }
+                onChange={(event) => {
+                  const next = Math.max(0, Number(event.target.value) || 0);
+                  setAutoAddLimit(next);
+                }}
               />
               <span className="text-slate-400">0 = vše</span>
             </label>
@@ -3844,14 +4020,20 @@ export default function Home() {
                 className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
                 placeholder="Název souboru: docx, smlouva, !eon ..."
                 value={query}
-                onChange={(event) => setQuery(event.target.value)}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setQuery(next);
+                }}
                 onKeyDown={(event) => { if (event.key === "Enter") handleSearch(); }}
               />
               <input
                 className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-4 py-2 text-sm text-slate-100"
                 placeholder="Obsah souboru: faktura, !zruseno ..."
                 value={contentQuery}
-                onChange={(event) => setContentQuery(event.target.value)}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setContentQuery(next);
+                }}
                 onKeyDown={(event) => { if (event.key === "Enter") handleSearch(); }}
               />
               <div className="flex items-center gap-2 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
@@ -3862,11 +4044,13 @@ export default function Home() {
                   max={50}
                   className="w-16 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
                   value={ocrMaxPages}
-                  onChange={(event) =>
-                    setOcrMaxPages(
-                      Math.min(50, Math.max(1, Number(event.target.value) || 1))
-                    )
-                  }
+                  onChange={(event) => {
+                    const next = Math.min(
+                      50,
+                      Math.max(1, Number(event.target.value) || 1)
+                    );
+                    setOcrMaxPages(next);
+                  }}
                 />
               </div>
               <div className="flex items-center gap-1 rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
@@ -3876,7 +4060,10 @@ export default function Home() {
                   min={0}
                   className="w-16 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
                   value={folderMaxDays}
-                  onChange={(event) => setFolderMaxDays(Math.max(0, Number(event.target.value) || 0))}
+                  onChange={(event) => {
+                    const next = Math.max(0, Number(event.target.value) || 0);
+                    setFolderMaxDays(next);
+                  }}
                   title="Změna za posledních X dní (0 = vše)"
                 />
               </div>
@@ -3888,7 +4075,10 @@ export default function Home() {
                 {isSearching ? "Hledám..." : "Hledat"}
               </button>
               <button
-                onClick={() => setSearchMode(searchMode === "and" ? "or" : "and")}
+                onClick={() => {
+                  const next = searchMode === "and" ? "or" : "and";
+                  setSearchMode(next);
+                }}
                 className={`px-3 py-2 text-xs rounded-2xl font-semibold transition ${
                   searchMode === "and"
                     ? "bg-slate-700 text-slate-100"

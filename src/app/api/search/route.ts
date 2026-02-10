@@ -237,9 +237,15 @@ export async function POST(request: Request) {
     const maxChunks = payload.maxContextChunks || 200;
     const limitedResults = results.slice(0, maxChunks);
     
-    // Build context from search results
+    // Build context from search results with metadata
     const context = limitedResults
-      .map((doc) => `Source: ${doc.metadata.source}\n${doc.pageContent}`)
+      .map((doc) => {
+        const metaInfo = [];
+        if (doc.metadata.line_count) metaInfo.push(`lines: ${doc.metadata.line_count}`);
+        if (doc.metadata.file_size) metaInfo.push(`size: ${doc.metadata.file_size} bytes`);
+        const metaStr = metaInfo.length > 0 ? ` (${metaInfo.join(', ')})` : '';
+        return `Source: ${doc.metadata.source}${metaStr}\n${doc.pageContent}`;
+      })
       .join("\n\n---\n\n");
 
     // Generate response with Gemini
@@ -260,7 +266,7 @@ export async function POST(request: Request) {
     const fullContextInstruction = wantsFullContextTab
       ? `\n\nThe user explicitly asked for a full-context tab. In the structured results, add a group with client "Cely kontext" that lists ONLY the file paths from the Sources list below. Do not add any other paths. Use brief Czech descriptions like "Soubor z kontextu".`
       : "";
-    const accessInstruction = `\n\nYou have access ONLY to the provided Documents text. Never say things like "Nemám přístup k obsahu souborů" or "nemohu spočítat" because you can access the provided Documents. If the Documents do not contain the needed information, say in Czech that the provided documents are insufficient and ask the user to add the relevant files to context.`;
+    const accessInstruction = `\n\nYou have access ONLY to the provided Documents text. Never say things like "Nemám přístup k obsahu souborů" or "nemohu spočítat" because you can access the provided Documents. If the Documents do not contain the needed information, say in Czech that the provided documents are insufficient and ask the user to add the relevant files to context.\n\nIMPORTANT: Each document chunk contains metadata including 'line_count' (total lines in original file) and 'file_size' (bytes). When asked about statistics like "kolik mají celkem řádků" (how many lines total), you MUST:\n1. Identify all unique source files from the documents\n2. For each unique file, extract the line_count from metadata (it's the same for all chunks from one file)\n3. Sum up the line_count values for all unique files\n4. Present the result in Czech with details per file if helpful.`;
     
     const contextInfo = results.length > maxChunks 
       ? `\n\nIMPORTANT: You are analyzing ${limitedResults.length} chunks out of ${results.length} total chunks from ${allSources.length} files. The analysis is based on a representative sample.`
