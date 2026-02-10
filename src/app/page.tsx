@@ -32,6 +32,7 @@ type FileContext = {
   path: string;
   content: string;
   size: number;
+  lineCount: number;
   modified?: string;
   created?: string;
 };
@@ -1151,7 +1152,7 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [structuredResult, setStructuredResult] = useState<StructuredResult | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("chat");
-  const [lastSearchSources, setLastSearchSources] = useState<string[]>([]);
+  const [lastSearchSources, setLastSearchSources] = useState<Array<{ path: string; lineCount?: number; fileSize?: number }>>([]);
   const [isSending, setIsSending] = useState(false);
   const [isIndexing, setIsIndexing] = useState(false);
   const [isRebuilding, setIsRebuilding] = useState(false);
@@ -2117,20 +2118,23 @@ export default function Home() {
       if (!response.ok) {
         throw new Error(data.error ?? "Extraction failed.");
       }
+      let text = data.text ?? "";
+      const lineCount = text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
       setFileContext((prev) => [
         ...prev,
         {
           path: filePath,
-          content: data.text ?? "",
+          content: text,
           size: data.textLength ?? 0,
+          lineCount,
         },
       ]);
       try {
-        const text = (data.text ?? "").slice(0, MAX_FILE_BYTES);
+        const clipped = text.slice(0, MAX_FILE_BYTES);
         await cachePutText({
           path: filePath,
-          text,
-          size: text.length,
+          text: clipped,
+          size: clipped.length,
           storedAt: Date.now(),
         });
       } catch {
@@ -2211,12 +2215,15 @@ export default function Home() {
           error?: string;
         };
         if (response.ok) {
+          const text = data.text ?? "";
+          const lineCount = text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
           setFileContext((prev) => [
             ...prev,
             {
               path: file.path,
-              content: data.text ?? "",
+              content: text,
               size: data.textLength ?? 0,
+              lineCount,
               modified: file.modified,
               created: file.created,
             },
@@ -2336,10 +2343,12 @@ export default function Home() {
             });
           }
         );
+        const lineCount = content.split('\n').length - (content.endsWith('\n') ? 1 : 0);
         newContext.push({
           path: entry.path,
           content,
           size: entry.size,
+          lineCount,
           modified: entry.modified,
         });
       } catch {
@@ -2632,7 +2641,7 @@ export default function Home() {
         continue;
       }
 
-      batch.push({ path, content: text, size: text.length });
+      batch.push({ path, content: text, size: text.length, lineCount: text.split('\n').length - (text.endsWith('\n') ? 1 : 0) });
       loaded += 1;
       if (batch.length >= BATCH_FLUSH) {
         const toAdd = batch.splice(0, batch.length);
@@ -3349,7 +3358,13 @@ export default function Home() {
       const isCountRequest =
         /\bkolik\b/i.test(trimmed) &&
         /soubor/i.test(trimmed);
-      if (isCountRequest) {
+      
+      // Special case: questions about file count in context should go to API
+      const isContextFileCountRequest = 
+        isCountRequest &&
+        /kontext/i.test(trimmed);
+      
+      if (isCountRequest && !isContextFileCountRequest) {
         const wantsLineCountsPerFile =
           /(radk|řádk)/i.test(trimmed) &&
           /(kazd|každ)/i.test(trimmed);
@@ -3495,7 +3510,7 @@ export default function Home() {
       const data = (await response.json()) as {
         text?: string;
         error?: string;
-        sources?: string[];
+        sources?: Array<{ path: string; lineCount?: number; fileSize?: number }>;
         relevantChunks?: number;
         chunksUsedInPrompt?: number;
       };
@@ -3504,8 +3519,7 @@ export default function Home() {
       }
 
       if (Array.isArray(data.sources)) {
-        const unique = Array.from(new Set(data.sources.map((s) => String(s)).filter(Boolean)));
-        setLastSearchSources(unique);
+        setLastSearchSources(data.sources);
       }
       let processedText = data.text ?? "";
       
@@ -3555,7 +3569,7 @@ export default function Home() {
 
   const assistantAllFiles = useMemo(() => {
     const seen = new Set<string>();
-    const items: Array<{ path: string; description?: string }> = [];
+    const items: Array<{ path: string; description?: string; lineCount?: number; fileSize?: number }> = [];
     if (structuredResult) {
       for (const group of structuredResult.groups) {
         for (const f of group.files) {
@@ -3568,10 +3582,14 @@ export default function Home() {
       return items;
     }
     for (const src of lastSearchSources) {
-      const p = String(src ?? "").trim();
+      const p = String(src.path ?? "").trim();
       if (!p || seen.has(p)) continue;
       seen.add(p);
-      items.push({ path: p });
+      items.push({ 
+        path: p, 
+        lineCount: src.lineCount, 
+        fileSize: src.fileSize 
+      });
     }
     return items;
   }, [structuredResult, lastSearchSources]);
@@ -4371,6 +4389,25 @@ export default function Home() {
                 <p className="mt-1 text-xs text-slate-400">
                   {contextText.length} / {MAX_CONTEXT_CHARS} chars
                 </p>
+                {fileContext.length > 0 && (() => {
+                  const totalLines = fileContext.reduce((sum, f) => sum + (f.lineCount || 0), 0);
+                  const totalSize = fileContext.reduce((sum, f) => sum + (f.size || 0), 0);
+                  const formatSize = (bytes: number) => {
+                    if (bytes < 1024) return `${bytes} B`;
+                    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+                    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+                    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+                  };
+                  return (
+                    <div className="mt-2 bg-slate-900/50 rounded-lg p-2 border border-slate-800">
+                      <div className="text-[11px] text-slate-400 grid grid-cols-3 gap-2">
+                        <div><span className="text-slate-500">Řádky:</span> <span className="text-emerald-400 font-semibold">{totalLines.toLocaleString('cs-CZ')}</span></div>
+                        <div><span className="text-slate-500">Velikost:</span> <span className="text-emerald-400 font-semibold">{formatSize(totalSize)}</span></div>
+                        <div><span className="text-slate-500">Průměr:</span> <span className="text-blue-400 font-semibold">{Math.round(totalSize / Math.max(fileContext.length, 1) / 1024)} KB</span></div>
+                      </div>
+                    </div>
+                  );
+                })()}
                 <div className="mt-3">
                   <input
                     className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500"
@@ -4393,9 +4430,12 @@ export default function Home() {
                       key={item.path}
                       className="flex items-center justify-between gap-2 rounded-xl border border-slate-800 bg-slate-900/40 px-3 py-2"
                     >
-                      <span className="text-slate-200">{item.path}</span>
+                      <div className="flex-1 min-w-0">
+                        <span className="text-slate-200 block truncate">{item.path}</span>
+                        <span className="text-[10px] text-slate-500">{item.lineCount} řádků • {(item.size / 1024).toFixed(1)} KB</span>
+                      </div>
                       <button
-                        className="text-xs text-rose-300"
+                        className="text-xs text-rose-300 whitespace-nowrap"
                         onClick={() => handleRemoveContext(item.path)}
                       >
                         Remove
@@ -4739,6 +4779,47 @@ export default function Home() {
             <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
               {assistantAllFiles.length > 0 ? (
                 <div className="space-y-4">
+                  {(() => {
+                    const totalLineCount = assistantAllFiles.reduce((sum, f) => sum + (f.lineCount || 0), 0);
+                    const totalFileSize = assistantAllFiles.reduce((sum, f) => sum + (f.fileSize || 0), 0);
+                    const formatSize = (bytes?: number) => {
+                      if (!bytes || bytes <= 0) return "0 B";
+                      if (bytes < 1024) return `${bytes} B`;
+                      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+                      if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+                      return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+                    };
+
+                    return (
+                      <div className="bg-slate-900/50 rounded-lg p-3 border border-slate-800">
+                        <div className="text-sm text-slate-300 grid grid-cols-2 gap-3 md:grid-cols-4">
+                          <div>
+                            <p className="text-slate-500 text-xs">Soubory</p>
+                            <p className="font-semibold text-emerald-400">{assistantAllFiles.length}</p>
+                          </div>
+                          {totalLineCount > 0 && (
+                            <div>
+                              <p className="text-slate-500 text-xs">Řádky celkem</p>
+                              <p className="font-semibold text-emerald-400">{totalLineCount.toLocaleString("cs-CZ")}</p>
+                            </div>
+                          )}
+                          {totalFileSize > 0 && (
+                            <div>
+                              <p className="text-slate-500 text-xs">Velikost</p>
+                              <p className="font-semibold text-emerald-400">{formatSize(totalFileSize)}</p>
+                            </div>
+                          )}
+                          <div>
+                            <p className="text-slate-500 text-xs">Zdroj</p>
+                            <p className="font-semibold text-blue-400">
+                              {structuredResult ? "Strukturované" : lastSearchSources.length > 0 ? "Vyhledávání" : "?"}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <p className="text-sm text-slate-300">
                       Zobrazuji {assistantAllFiles.length} unikátních souborů
@@ -4772,26 +4853,40 @@ export default function Home() {
                         <tr className="border-b border-slate-700">
                           <th className="text-left py-2 px-3 text-slate-300 font-medium">#</th>
                           <th className="text-left py-2 px-3 text-slate-300 font-medium">Soubor</th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Řádky</th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Velikost</th>
                           <th className="text-left py-2 px-3 text-slate-300 font-medium">Popis</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {assistantAllFiles.map((file, idx) => (
-                          <tr key={`${file.path}-${idx}`} className="border-b border-slate-800 hover:bg-slate-900/50">
-                            <td className="py-2 px-3 text-slate-400">{idx + 1}</td>
-                            <td className="py-2 px-3">
-                              <a
-                                className="text-emerald-400 hover:text-emerald-300 hover:underline text-left break-all"
-                                href={`/api/download?path=${encodeURIComponent(file.path)}`}
-                                title="Stáhnout soubor"
-                              >
-                                {file.path.split("/").pop() || file.path}
-                              </a>
-                              <div className="text-xs text-slate-500 mt-1">{file.path}</div>
-                            </td>
-                            <td className="py-2 px-3 text-slate-300">{file.description || "-"}</td>
-                          </tr>
-                        ))}
+                        {assistantAllFiles.map((file, idx) => {
+                          const formatSize = (bytes?: number) => {
+                            if (!bytes || bytes <= 0) return "-";
+                            if (bytes < 1024) return `${bytes} B`;
+                            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+                            if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+                            return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+                          };
+                          
+                          return (
+                            <tr key={`${file.path}-${idx}`} className="border-b border-slate-800 hover:bg-slate-900/50">
+                              <td className="py-2 px-3 text-slate-400">{idx + 1}</td>
+                              <td className="py-2 px-3">
+                                <a
+                                  className="text-emerald-400 hover:text-emerald-300 hover:underline text-left break-all"
+                                  href={`/api/download?path=${encodeURIComponent(file.path)}`}
+                                  title="Stáhnout soubor"
+                                >
+                                  {file.path.split("/").pop() || file.path}
+                                </a>
+                                <div className="text-xs text-slate-500 mt-1">{file.path}</div>
+                              </td>
+                              <td className="py-2 px-3 text-slate-400">{file.lineCount ? `${file.lineCount.toLocaleString("cs-CZ")}` : "-"}</td>
+                              <td className="py-2 px-3 text-slate-400">{formatSize(file.fileSize)}</td>
+                              <td className="py-2 px-3 text-slate-300">{file.description || "-"}</td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

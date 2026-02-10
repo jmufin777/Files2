@@ -221,14 +221,34 @@ export async function POST(request: Request) {
       );
     }
 
-    const allSources = Array.from(new Set(results.map((r) => r.metadata.source)));
+    // Build detailed source metadata (path, line_count, file_size)
+    const sourceMetadataMap = new Map<string, { lineCount?: number; fileSize?: number }>();
+    for (const doc of results) {
+      const sourcePath = doc.metadata.source as string;
+      if (!sourceMetadataMap.has(sourcePath)) {
+        sourceMetadataMap.set(sourcePath, {
+          lineCount: doc.metadata.line_count as number | undefined,
+          fileSize: doc.metadata.file_size as number | undefined,
+        });
+      }
+    }
+
+    const allSources = Array.from(sourceMetadataMap.keys());
+    const sourcesList = allSources.map((path) => {
+      const meta = sourceMetadataMap.get(path);
+      return {
+        path,
+        lineCount: meta?.lineCount,
+        fileSize: meta?.fileSize,
+      };
+    });
     
     // Pokud analyzeOnly=true, vrať jen statistiky bez volání Gemini
     if (payload.analyzeOnly) {
       return NextResponse.json({
         text: `Nalezeno ${results.length} chunků z ${allSources.length} souborů.`,
         relevantChunks: results.length,
-        sources: allSources,
+        sources: sourcesList,
         analyzedOnly: true,
       });
     }
@@ -268,14 +288,30 @@ export async function POST(request: Request) {
       : "";
     const accessInstruction = `\n\nYou have access ONLY to the provided Documents text. Never say things like "Nemám přístup k obsahu souborů" or "nemohu spočítat" because you can access the provided Documents. If the Documents do not contain the needed information, say in Czech that the provided documents are insufficient and ask the user to add the relevant files to context.\n\nIMPORTANT: Each document chunk contains metadata including 'line_count' (total lines in original file) and 'file_size' (bytes). When asked about statistics like "kolik mají celkem řádků" (how many lines total), you MUST:\n1. Identify all unique source files from the documents\n2. For each unique file, extract the line_count from metadata (it's the same for all chunks from one file)\n3. Sum up the line_count values for all unique files\n4. Present the result in Czech with details per file if helpful.`;
     
+    const contextCounts = (() => {
+      let totalLines = 0;
+      let totalSizeBytes = 0;
+      for (const doc of results) {
+        if (doc.metadata.line_count) totalLines += doc.metadata.line_count as number;
+        if (doc.metadata.file_size) totalSizeBytes += doc.metadata.file_size as number;
+      }
+      return { files: allSources.length, totalLines, totalSizeBytes };
+    })();
+
+    const contextCountsInstruction = `\n\nIMPORTANT: When the user asks a question in Czech about the NUMBER/COUNT of files in the context, you must recognize patterns like:
+- Questions containing "kolik" (how many) + any form of "soubor" (file) + "kontext" (context)
+- This includes ALL grammatical variations: "souboru", "souborů", "soubory", "soubor"
+- Examples: "kolik je souboru", "kolik je souborů", "kolik je soubory", "kolik máme souboru", "kolik mame souboru", "kolik mám souboru", "počet souboru", "počet souborů"
+- When you detect such a question, ALWAYS respond with ONLY: "V kontextu máte ${contextCounts.files} souborů, celkem asi ${contextCounts.totalLines.toLocaleString()} řádků a ${(contextCounts.totalSizeBytes / (1024 * 1024)).toFixed(1)} MB." in Czech. Nothing else - just this answer.`;
+
     const contextInfo = results.length > maxChunks 
       ? `\n\nIMPORTANT: You are analyzing ${limitedResults.length} chunks out of ${results.length} total chunks from ${allSources.length} files. The analysis is based on a representative sample.`
       : `\n\nYou are analyzing ${results.length} chunks from ${allSources.length} files.`;
 
-    const sourcesList = allSources.length
-      ? `\n\nSources:\n${allSources.map((source) => `- ${source}`).join("\n")}`
+    const sourcesTextList = allSources.length
+      ? `\n\nSources (${allSources.length} files):\n${allSources.map((source) => `- ${source}`).join("\n")}`
       : "\n\nSources:\n(none)";
-    const prompt = `Based on the following documents, answer the query:${contextInfo}${sourcesList}\n\nDocuments:\n${context}\n\nQuery: ${payload.query}${chartInstruction}${structuredInstruction}${fullContextInstruction}${accessInstruction}`;
+    const prompt = `Based on the following documents, answer the query:${contextInfo}${sourcesTextList}\n\nDocuments:\n${context}\n\nQuery: ${payload.query}${chartInstruction}${contextCountsInstruction}${structuredInstruction}${fullContextInstruction}${accessInstruction}`;
     const response = await model.generateContent(prompt);
     const text = response.response.text();
 
@@ -283,7 +319,7 @@ export async function POST(request: Request) {
       text,
       relevantChunks: results.length,
       chunksUsedInPrompt: limitedResults.length,
-      sources: allSources,
+      sources: sourcesList,
     });
   } catch (error) {
     console.error("Search error:", error);
