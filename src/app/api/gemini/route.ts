@@ -8,7 +8,56 @@ type GeminiRequest = {
   context?: string;
 };
 
+// Rate limiting
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const REQUESTS_PER_WINDOW = 30;
+const MAX_REQUEST_SIZE = 50 * 1024 * 1024; // 50MB
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const record = rateLimitMap.get(ip);
+
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+
+  if (record.count >= REQUESTS_PER_WINDOW) {
+    return false;
+  }
+
+  record.count++;
+  return true;
+}
+
+function getClientIp(request: Request): string {
+  return (
+    request.headers.get("x-forwarded-for")?.split(",")[0] ||
+    request.headers.get("x-real-ip") ||
+    "unknown"
+  );
+}
+
 export async function POST(request: Request) {
+  // Rate limiting check
+  const clientIp = getClientIp(request);
+  if (!checkRateLimit(clientIp)) {
+    return NextResponse.json(
+      { error: "Rate limit exceeded. Maximum 30 requests per minute." },
+      { status: 429 }
+    );
+  }
+
+  // Check request content length
+  const contentLength = request.headers.get("content-length");
+  if (contentLength && parseInt(contentLength) > MAX_REQUEST_SIZE) {
+    return NextResponse.json(
+      { error: `Request too large. Maximum size: ${MAX_REQUEST_SIZE / 1024 / 1024}MB` },
+      { status: 413 }
+    );
+  }
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
@@ -19,13 +68,45 @@ export async function POST(request: Request) {
 
   let payload: GeminiRequest = {};
   try {
-    payload = (await request.json()) as GeminiRequest;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON." }, { status: 400 });
+    const text = await request.text();
+    
+    // Check if response looks like HTML error page
+    if (text.trim().startsWith("<")) {
+      return NextResponse.json(
+        { 
+          error: "Invalid JSON received. Server returned HTML instead of JSON.",
+          details: text.substring(0, 300)
+        },
+        { status: 400 }
+      );
+    }
+    
+    payload = JSON.parse(text) as GeminiRequest;
+  } catch (parseError) {
+    const errorMsg = parseError instanceof Error ? parseError.message : "Unknown parse error";
+    return NextResponse.json(
+      { 
+        error: "Invalid JSON in request body.",
+        details: errorMsg
+      },
+      { status: 400 }
+    );
   }
 
-  if (!payload.message) {
-    return NextResponse.json({ error: "Message is required." }, { status: 400 });
+  // Validate message
+  if (!payload.message || typeof payload.message !== "string") {
+    return NextResponse.json(
+      { error: "Message is required and must be a string." },
+      { status: 400 }
+    );
+  }
+
+  // Validate message length
+  if (payload.message.length > 50000) {
+    return NextResponse.json(
+      { error: "Message too long. Maximum 50000 characters." },
+      { status: 400 }
+    );
   }
 
   try {
@@ -69,10 +150,13 @@ When the user asks a question in Czech about the NUMBER/COUNT of files in the co
 
     return NextResponse.json({ text });
   } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : "Gemini request failed.";
+    console.error("[Gemini API Error]", errorMsg);
+    
     return NextResponse.json(
       {
-        error:
-          error instanceof Error ? error.message : "Gemini request failed.",
+        error: errorMsg,
+        hint: "Check if your context contains valid data. Invalid/HTML responses are gracefully handled.",
       },
       { status: 500 }
     );
