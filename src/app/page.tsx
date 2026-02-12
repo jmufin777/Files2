@@ -1221,6 +1221,21 @@ export default function Home() {
     DEFAULT_SECRET_WORD_SETTINGS
   );
   const [isDeletingSecretWord, setIsDeletingSecretWord] = useState(false);
+  const [dataWarning, setDataWarning] = useState<{
+    visible: boolean;
+    title?: string;
+    details?: string;
+    filteredFiles?: number;
+    totalFiles?: number;
+    onConfirm?: () => void;
+  }>({ visible: false });
+  const [pendingChatRequest, setPendingChatRequest] = useState<{
+    message: string;
+    contextText: string;
+    totalFiles: number;
+    filteredFiles: number;
+    contextSize: number;
+  } | null>(null);
 
   const loadSecretWordSettings = (word: string): SecretWordSettings => {
     if (typeof window === "undefined" || word.length < 5) {
@@ -3488,13 +3503,26 @@ export default function Home() {
 
       // Use indexed search if available, otherwise fall back to direct gemini
       const endpoint = hasDbIndex ? "/api/search" : "/api/gemini";
+      
+      // Build body with filtering info
+      const filteredContextToUse = filteredContext.length > 0 ? buildContext(filteredContext) : buildContext(fileContext);
+      const totalFilesCount = fileContext.length;
+      const filteredFilesCount = filteredContext.length > 0 ? filteredContext.length : fileContext.length;
+      const contextSizeBytes = filteredContextToUse.length;
+      
       const body =
         hasDbIndex
           ? JSON.stringify({ 
               query: trimmed, 
               secretWord: secretWord || undefined
             })
-          : JSON.stringify({ message: trimmed, context: contextText });
+          : JSON.stringify({ 
+              message: trimmed, 
+              context: filteredContextToUse,
+              totalFiles: totalFilesCount,
+              filteredFiles: filteredFilesCount,
+              contextSize: contextSizeBytes
+            });
 
       let response: Response;
       try {
@@ -3510,10 +3538,49 @@ export default function Home() {
       const data = (await response.json()) as {
         text?: string;
         error?: string;
+        warning?: string;
+        details?: string;
         sources?: Array<{ path: string; lineCount?: number; fileSize?: number }>;
         relevantChunks?: number;
         chunksUsedInPrompt?: number;
+        filteredFiles?: number;
+        totalFiles?: number;
       };
+      
+      // Handle data size warning (202 Accepted)
+      if (response.status === 202 && data.warning) {
+        // Store pending request info for potential retry
+        setPendingChatRequest({
+          message: trimmed,
+          contextText: filteredContextToUse,
+          totalFiles: totalFilesCount,
+          filteredFiles: filteredFilesCount,
+          contextSize: contextSizeBytes
+        });
+        
+        // Set warning dialog
+        setDataWarning({
+          visible: true,
+          title: data.warning,
+          details: data.details,
+          filteredFiles: data.filteredFiles,
+          totalFiles: data.totalFiles,
+          onConfirm: async () => {
+            // Resend request without size checks (would need backend flag to skip)
+            // For now, just show message and let user retry when data is smaller
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                text: "Zmenšete prosím kontext (odfiltrujte méně souborů) a zkuste znovu. Nebo zkuste hledání přes Knowledge Base pokud máte data zaindexovaná.",
+              },
+            ]);
+          }
+        });
+        setIsSending(false);
+        return;
+      }
+      
       if (!response.ok) {
         throw new Error(data.error ?? "Request failed.");
       }
@@ -4900,6 +4967,42 @@ export default function Home() {
             </div>
           )}
         </section>
+
+        {/* Data size warning dialog */}
+        {dataWarning.visible && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+            <div className="rounded-2xl border border-amber-700 bg-amber-950 p-6 max-w-md shadow-lg">
+              <h2 className="text-lg font-semibold text-amber-200 mb-3">
+                ⚠️ {dataWarning.title || "Velké množství dat"}
+              </h2>
+              <p className="text-sm text-amber-100 mb-4">
+                {dataWarning.details || "Zpracování těchto dat může trvat déle."}
+              </p>
+              {dataWarning.filteredFiles !== undefined && dataWarning.totalFiles !== undefined && (
+                <p className="text-xs text-amber-300 mb-4">
+                  Filtrované: {dataWarning.filteredFiles} / {dataWarning.totalFiles} souborů
+                </p>
+              )}
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setDataWarning({ visible: false })}
+                  className="flex-1 rounded-lg bg-slate-700 hover:bg-slate-600 px-4 py-2 text-sm font-medium text-slate-200 transition"
+                >
+                  Zrušit
+                </button>
+                <button
+                  onClick={() => {
+                    setDataWarning({ visible: false });
+                    if (dataWarning.onConfirm) dataWarning.onConfirm();
+                  }}
+                  className="flex-1 rounded-lg bg-amber-600 hover:bg-amber-700 px-4 py-2 text-sm font-medium text-white transition"
+                >
+                  Pokračovat
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

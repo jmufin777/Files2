@@ -6,6 +6,10 @@ export const runtime = "nodejs";
 type GeminiRequest = {
   message?: string;
   context?: string;
+  // Filtering information
+  totalFiles?: number;      // Total files available (before filtering)
+  filteredFiles?: number;   // Files actually in context (after filtering)
+  contextSize?: number;     // Size of context in bytes
 };
 
 // Rate limiting
@@ -13,6 +17,13 @@ const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT_WINDOW = 60000; // 1 minute
 const REQUESTS_PER_WINDOW = 30;
 const MAX_REQUEST_SIZE = 50 * 1024 * 1024; // 50MB
+
+// Data size limits for detection
+const DATA_SIZE_THRESHOLDS = {
+  WARN_FILES: 500,        // Warn if > 500 files
+  WARN_SIZE_MB: 10,       // Warn if > 10MB
+  WARN_CONTEXT_CHARS: 100_000, // Warn if context > 100k chars
+};
 
 function checkRateLimit(ip: string): boolean {
   const now = Date.now();
@@ -37,6 +48,39 @@ function getClientIp(request: Request): string {
     request.headers.get("x-real-ip") ||
     "unknown"
   );
+}
+
+function checkDataSize(payload: GeminiRequest): { shouldWarn: boolean; reason?: string; details?: string } {
+  const { filteredFiles = 0, contextSize = 0, context = "" } = payload;
+  const contextChars = context?.length ?? 0;
+
+  // Check if data might be too large for processing
+  if (filteredFiles > DATA_SIZE_THRESHOLDS.WARN_FILES) {
+    return {
+      shouldWarn: true,
+      reason: `Velké množství dat: ${filteredFiles} souborů`,
+      details: `Zpracování ${filteredFiles} souborů může trvat dlouho. Zvažte filtrování.`
+    };
+  }
+
+  if (contextSize > DATA_SIZE_THRESHOLDS.WARN_SIZE_MB * 1024 * 1024) {
+    const sizeMB = (contextSize / (1024 * 1024)).toFixed(1);
+    return {
+      shouldWarn: true,
+      reason: `Velký objem dat: ~${sizeMB} MB`,
+      details: `Kontekt o velikosti ${sizeMB} MB může být pomalejší k zpracování.`
+    };
+  }
+
+  if (contextChars > DATA_SIZE_THRESHOLDS.WARN_CONTEXT_CHARS) {
+    return {
+      shouldWarn: true,
+      reason: `Dlouhý kontext: ~${contextChars.toLocaleString('cs-CZ')} znaků`,
+      details: `Kontext překračuje doporučený limit. Odpověď může být pomalejší.`
+    };
+  }
+
+  return { shouldWarn: false };
 }
 
 export async function POST(request: Request) {
@@ -109,12 +153,29 @@ export async function POST(request: Request) {
     );
   }
 
+  // Check data size and warn if necessary
+  const sizeCheck = checkDataSize(payload);
+  if (sizeCheck.shouldWarn) {
+    return NextResponse.json(
+      {
+        warning: sizeCheck.reason,
+        details: sizeCheck.details,
+        filteredFiles: payload.filteredFiles,
+        totalFiles: payload.totalFiles,
+      },
+      { status: 202 } // 202 Accepted - continue but with warning
+    );
+  }
+
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const modelName = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    const chartInstruction = `\n\nIf the user asks to show, visualize, chart or graph data, extract the numbers from the context and return a chart block using EXACTLY this format at the end:\n[[CHART]]\n{"title":"<short title>","type":"pie|bar","labels":["A","B"],"series":[10,20]}\n[[/CHART]]\nOnly include the chart block if you have reliable numbers. Keep the rest of the answer in Czech.`;
+    const chartInstruction = `\n\nIf the user asks to show, visualize, chart or graph data, follow these rules:
+1. If requesting a chart with SPECIFIC numbers or data from context: extract the numbers from the context and create the chart
+2. If requesting a chart with RANDOM/FICTIONAL data (e.g., "random 500 files", "example chart"): generate plausible fictional data with realistic distribution
+3. Always return the chart block using EXACTLY this format at the end:\n[[CHART]]\n{"title":"<short title>","type":"pie|bar|line","labels":["A","B","C"],"series":[10,20,30]}\n[[/CHART]]\nSupport types: pie, bar, line. Only include the chart block if you can provide reliable or appropriately generated numbers. Keep the rest of the answer in Czech.`;
     
     // Count files and stats from context header if available
     const contextCountMatch = payload.context?.match(/^Kontext \((\d+)\)\s*\n/m);
