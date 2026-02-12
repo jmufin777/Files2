@@ -234,6 +234,75 @@ export async function POST(request: Request) {
     }
 
     const allSources = Array.from(sourceMetadataMap.keys());
+    
+    // For accurate file counts (when asking "kolik je souboru v kontextu"),
+    // we need to count ALL unique sources for this secretWord, not just those in search results
+    let totalDatabaseFiles = allSources.length;
+    let totalDatabaseStats: { totalLines: number; totalSize: number } | null = null;
+    
+    // Check if this is a file count query (including typos like "koliok", "soubpru" etc.)
+    const isFileCountQuery = /\bkoli\w*/i.test(payload.query) && 
+                              /\bsoub\w*/i.test(payload.query) && 
+                              /kontext/i.test(payload.query);
+    
+    if (isFileCountQuery) {
+      // Query ALL sources for this secretWord to get accurate count
+      try {
+        let countQuery = `
+          SELECT metadata->>'source' as source,
+                 MAX((metadata->>'line_count')::int) as line_count,
+                 MAX((metadata->>'file_size')::int) as file_size
+          FROM ${VECTOR_TABLE_NAME}
+          WHERE 1=1
+        `;
+        const countParams: any[] = [];
+        if (contextPrefix) {
+          countParams.push(contextPrefix + '%');
+          countQuery += ` AND metadata->>'source' LIKE $${countParams.length}`;
+        }
+        countQuery += ` GROUP BY metadata->>'source'`;
+        
+        const countResult = await pool.query<{
+          source: string;
+          line_count: number;
+          file_size: number;
+        }>(countQuery, countParams);
+        
+        console.log(`[File Count Query] Found ${countResult.rows.length} unique files for secretWord: ${payload.secretWord || '(none)'}`);
+        console.log(`[File Count Query] SQL: ${countQuery}`);
+        console.log(`[File Count Query] Params: ${JSON.stringify(countParams)}`);
+        
+        totalDatabaseFiles = countResult.rows.length;
+        totalDatabaseStats = countResult.rows.reduce((acc, row) => ({
+          totalLines: acc.totalLines + (row.line_count || 0),
+          totalSize: acc.totalSize + (row.file_size || 0),
+        }), { totalLines: 0, totalSize: 0 });
+        
+        // For file count questions, return direct response without calling AI
+        const formatSize = (bytes: number) => {
+          if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+          if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+          return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+        };
+        
+        const response = `V kontextu máte celkem ${totalDatabaseFiles} souborů. Pro práci jsou připraveny ${totalDatabaseFiles} soubory (výběr z indexu), celkem asi ${totalDatabaseStats.totalLines.toLocaleString()} řádků a ${formatSize(totalDatabaseStats.totalSize)}.`;
+        
+        return NextResponse.json({
+          text: response,
+          relevantChunks: 0,
+          chunksUsedInPrompt: 0,
+          sources: countResult.rows.map(row => ({
+            path: row.source,
+            lineCount: row.line_count,
+            fileSize: row.file_size,
+          })),
+          directAnswer: true,
+        });
+      } catch (err) {
+        console.error("Error counting total database files:", err);
+        // Fall back to search results and continue to AI response
+      }
+    }
     const sourcesList = allSources.map((path) => {
       const meta = sourceMetadataMap.get(path);
       return {
@@ -273,7 +342,11 @@ export async function POST(request: Request) {
     const modelName = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    const chartInstruction = `\n\nIf the user asks to show, visualize, chart or graph data, extract the numbers from the documents and return a chart block using EXACTLY this format at the end:\n[[CHART]]\n{"title":"<short title>","type":"pie|bar|line","labels":["A","B"],"series":[10,20]}\n[[/CHART]]\nOnly include the chart block if you have reliable numbers. Keep the rest of the answer in Czech.`;
+    const chartInstruction = `\n\nIf the user asks to show, visualize, chart, graph, or table data:
+1. **2D Charts** (pie, bar, line): [[CHART]]{"title":"...","type":"pie|bar|line","labels":["A","B"],"series":[10,20]}[[/CHART]]
+2. **3D Charts** (3 dimensions): [[CHART]]{"title":"...","type":"3d","data":[{"x":10,"y":20,"z":30,"label":"..."}],"xLabel":"X","yLabel":"Y","zLabel":"Z"}[[/CHART]]
+3. **Tables** (when asked for table format): [[TABLE]]{"title":"...","headers":["Col1","Col2"],"rows":[["val1","val2"]]}[[/TABLE]]
+Extract numbers from documents. Keep the rest in Czech.`;
     const wantsStructured = /(strukturov|structured|prehled|přehled)/i.test(
       payload.query
     );
@@ -289,6 +362,16 @@ export async function POST(request: Request) {
     const accessInstruction = `\n\nYou have access ONLY to the provided Documents text. Never say things like "Nemám přístup k obsahu souborů" or "nemohu spočítat" because you can access the provided Documents. If the Documents do not contain the needed information, say in Czech that the provided documents are insufficient and ask the user to add the relevant files to context.\n\nIMPORTANT: Each document chunk contains metadata including 'line_count' (total lines in original file) and 'file_size' (bytes). When asked about statistics like "kolik mají celkem řádků" (how many lines total), you MUST:\n1. Identify all unique source files from the documents\n2. For each unique file, extract the line_count from metadata (it's the same for all chunks from one file)\n3. Sum up the line_count values for all unique files\n4. Present the result in Czech with details per file if helpful.`;
     
     const contextCounts = (() => {
+      // If we did a full database count for file count query, use those stats
+      if (totalDatabaseStats) {
+        return { 
+          files: totalDatabaseFiles, 
+          totalLines: totalDatabaseStats.totalLines, 
+          totalSizeBytes: totalDatabaseStats.totalSize 
+        };
+      }
+      
+      // Otherwise, calculate from search results (allSources)
       let totalLines = 0;
       let totalSizeBytes = 0;
       // Sum per unique source to avoid counting the same file multiple times.
@@ -301,14 +384,16 @@ export async function POST(request: Request) {
     })();
 
     const contextCountsInstruction = `\n\nIMPORTANT: When the user asks a question in Czech about the NUMBER/COUNT of files in the context, you must recognize patterns like:
-- Questions containing "kolik" (how many) + any form of "soubor" (file) + "kontext" (context)
-- This includes ALL grammatical variations: "souboru", "souborů", "soubory", "soubor"
-- Examples: "kolik je souboru", "kolik je souborů", "kolik je soubory", "kolik máme souboru", "kolik mame souboru", "kolik mám souboru", "počet souboru", "počet souborů"
+- Questions containing "kolik" (how many) + any form starting with "soub" (soubor/souboru/souborů/soubory/soubpru etc.) + "kontext" (context)
+- This includes ALL grammatical variations and typos
+- Examples: "kolik je souboru", "kolik je souborů", "kolik je soubory", "kolik máme souboru", "kolik mame souboru", "kolik mám souboru", "počet souboru", "počet souborů", "kolik je soubpru"
   - When you detect such a question, ALWAYS respond with ONLY: "V kontextu máte celkem ${contextCounts.files} souborů. Pro práci jsou připraveny ${contextCounts.files} soubory (výběr z indexu), celkem asi ${contextCounts.totalLines.toLocaleString()} řádků a ${(contextCounts.totalSizeBytes / (1024 * 1024)).toFixed(1)} MB." in Czech. Nothing else - just this answer.`;
 
     const contextInfo = results.length > maxChunks 
       ? `\n\nIMPORTANT: You are analyzing ${limitedResults.length} chunks out of ${results.length} total chunks from ${allSources.length} files. The analysis is based on a representative sample.`
-      : `\n\nYou are analyzing ${results.length} chunks from ${allSources.length} files.`;
+      : totalDatabaseFiles > allSources.length
+        ? `\n\nYou are analyzing ${results.length} chunks from ${allSources.length} files (representing search results from a database with ${totalDatabaseFiles} total files).`
+        : `\n\nYou are analyzing ${results.length} chunks from ${allSources.length} files.`;
 
     const sourcesTextList = allSources.length
       ? `\n\nSources (${allSources.length} files):\n${allSources.map((source) => `- ${source}`).join("\n")}`

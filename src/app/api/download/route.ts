@@ -4,13 +4,22 @@ import { basename } from "path";
 
 export const runtime = "nodejs";
 
+function stripSecretWordPrefix(p: string): string {
+  // Our DB sources are stored like: "<secretWord>:/absolute/path".
+  // Avoid breaking Windows drive letters (e.g. "C:\\...") by requiring >= 5 chars before ':'.
+  const m = /^([^/\\]{5,}):([/\\].*)$/.exec(p);
+  return m ? m[2] : p;
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const filePath = searchParams.get("path");
+  const rawPath = searchParams.get("path");
 
-  if (!filePath) {
+  if (!rawPath) {
     return NextResponse.json({ error: "Missing path." }, { status: 400 });
   }
+
+  const filePath = stripSecretWordPrefix(rawPath);
 
   try {
     const stat = statSync(filePath);

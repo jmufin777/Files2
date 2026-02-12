@@ -173,10 +173,30 @@ export async function POST(request: Request) {
     const modelName = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    const chartInstruction = `\n\nIf the user asks to show, visualize, chart or graph data, follow these rules:
-1. If requesting a chart with SPECIFIC numbers or data from context: extract the numbers from the context and create the chart
-2. If requesting a chart with RANDOM/FICTIONAL data (e.g., "random 500 files", "example chart"): generate plausible fictional data with realistic distribution
-3. Always return the chart block using EXACTLY this format at the end:\n[[CHART]]\n{"title":"<short title>","type":"pie|bar|line","labels":["A","B","C"],"series":[10,20,30]}\n[[/CHART]]\nSupport types: pie, bar, line. Only include the chart block if you can provide reliable or appropriately generated numbers. Keep the rest of the answer in Czech.`;
+     const chartInstruction = `\n\nIf the user asks to show, visualize, chart or graph data, follow these rules:
+1. **2D Charts** (pie, bar, line): Use format:
+   [[CHART]]
+   {"title":"<short title>","type":"pie|bar|line","labels":["A","B","C"],"series":[10,20,30]}
+   [[/CHART]]
+   
+  2. **3D Charts** (ONLY when the user explicitly asks for 3D or wants to plot 3 dimensions): Use format:
+   [[CHART]]
+    {"title":"<short title>","type":"3d","data":[{"x":10,"y":20,"z":30,"label":"<meaningful label>","size":12,"color":"#3b82f6"}],"xLabel":"<meaningful X>","yLabel":"<meaningful Y>","zLabel":"<meaningful Z>"}
+   [[/CHART]]
+
+    3D chart requirements:
+    - Use REAL numbers extracted from Context when the user wants a factual chart (e.g. invoices, billing, amounts, dates). Do NOT invent values in that case.
+    - Make axis labels (xLabel/yLabel/zLabel) descriptive and taken from the domain, e.g. "Datum", "Částka bez DPH (Kč)", "Klient" (but z must still be numeric; encode categories as numeric and put the category into the point label).
+    - The point "label" must be a nice Czech tooltip derived from the content, e.g. "Colonnade – 2025-01 – 123 456 Kč bez DPH – faktura 2025/001".
+    - Prefer 10–200 points. If there are thousands of rows, aggregate or sample and say so in Czech.
+    - size/color are optional; if used, they should reflect meaning (e.g. size by amount).
+   
+3. **Tables** (when user asks to show data in table format, "ukaz tabulku", "vytvoř tabulku"): Use format:
+   [[TABLE]]
+   {"title":"<title>","headers":["Col1","Col2","Col3"],"rows":[["val1","val2","val3"],["val4","val5","val6"]]}
+   [[/TABLE]]
+   
+  For ALL formats: If requesting with SPECIFIC numbers from context, extract them accurately. If requesting RANDOM/FICTIONAL data, generate plausible realistic numbers. Keep the rest of the answer in Czech.`;
     
     // Count files and stats from context header if available
     // buildContext() returns format: "# Context summary\ntotal_files=N\ntotal_size_bytes=X\n..."

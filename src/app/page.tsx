@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
-import ResultsChart from "../components/ResultsChart";
+import ResultsChart, { type ChartType2D } from "../components/ResultsChart";
+import DataTable from "../components/DataTable";
+import Plot3D from "../components/Plot3D";
 
 type FileEntry = {
   path: string;
@@ -42,6 +44,13 @@ type ChatMessage = {
   text: string;
 };
 
+type ChatHistoryItem = {
+  id: string;
+  q: string;
+  ok: boolean;
+  ts: number;
+};
+
 type SpeechRecognitionResultLike = {
   0?: { transcript?: string };
   isFinal?: boolean;
@@ -78,15 +87,33 @@ type StructuredResult = {
 
 type ActiveTab = "chat" | "results" | "files";
 
-type ChartType = "pie" | "bar" | "line";
+type AssistantFileSortBy = "path" | "lines" | "size" | "description";
+
+type ChartType = "pie" | "bar" | "line" | "3d";
 type ChartSource = "results" | "samba";
 type AssistantChart = {
   title: string;
-  type: ChartType;
+  type: ChartType2D;
   labels: string[];
   series: number[];
 };
-type AssistantChartItem = AssistantChart & {
+type AssistantChart3D = {
+  title: string;
+  type: "3d";
+  data: Array<{ x: number; y: number; z: number; label?: string }>;
+  xLabel?: string;
+  yLabel?: string;
+  zLabel?: string;
+};
+type AssistantTable = {
+  title: string;
+  headers: string[];
+  rows: (string | number)[][];
+};
+type AssistantChartItem = (AssistantChart | AssistantChart3D) & {
+  id: string;
+};
+type AssistantTableItem = AssistantTable & {
   id: string;
 };
 type LoadProgress = {
@@ -1083,7 +1110,7 @@ function getExtension(path: string): string {
 
 function extractChartBlock(text: string): {
   cleanText: string;
-  chart: AssistantChart | null;
+  chart: AssistantChart | AssistantChart3D | null;
 } {
   const blockRegex = /\[\[CHART\]\]([\s\S]*?)\[\[\/CHART\]\]/i;
   const match = text.match(blockRegex);
@@ -1092,16 +1119,18 @@ function extractChartBlock(text: string): {
   }
 
   const raw = match[1].trim();
-  let chart: AssistantChart | null = null;
+  let chart: AssistantChart | AssistantChart3D | null = null;
   try {
-    const parsed = JSON.parse(raw) as AssistantChart;
-    if (
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.type === "3d" && Array.isArray(parsed.data)) {
+      chart = parsed as AssistantChart3D;
+    } else if (
       parsed &&
-      (parsed.type === "pie" || parsed.type === "bar") &&
+      (parsed.type === "pie" || parsed.type === "bar" || parsed.type === "line") &&
       Array.isArray(parsed.labels) &&
       Array.isArray(parsed.series)
     ) {
-      chart = parsed;
+      chart = parsed as AssistantChart;
     }
   } catch {
     chart = null;
@@ -1109,6 +1138,36 @@ function extractChartBlock(text: string): {
 
   const cleanText = text.replace(blockRegex, "").trim();
   return { cleanText, chart };
+}
+
+function extractTableBlock(text: string): {
+  cleanText: string;
+  table: AssistantTable | null;
+} {
+  const blockRegex = /\[\[TABLE\]\]([\s\S]*?)\[\[\/TABLE\]\]/i;
+  const match = text.match(blockRegex);
+  if (!match) {
+    return { cleanText: text, table: null };
+  }
+
+  const raw = match[1].trim();
+  let table: AssistantTable | null = null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      parsed.title &&
+      Array.isArray(parsed.headers) &&
+      Array.isArray(parsed.rows)
+    ) {
+      table = parsed as AssistantTable;
+    }
+  } catch {
+    table = null;
+  }
+
+  const cleanText = text.replace(blockRegex, "").trim();
+  return { cleanText, table };
 }
 
 function extractStructuredBlock(text: string): {
@@ -1150,6 +1209,7 @@ export default function Home() {
   const [isSearching, setIsSearching] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatHistory, setChatHistory] = useState<ChatHistoryItem[]>([]);
   const [structuredResult, setStructuredResult] = useState<StructuredResult | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("chat");
   const [lastSearchSources, setLastSearchSources] = useState<Array<{ path: string; lineCount?: number; fileSize?: number }>>([]);
@@ -1182,11 +1242,16 @@ export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const voiceBaseInputRef = useRef("");
   const voiceFinalRef = useRef("");
-  const [chartType, setChartType] = useState<ChartType>("pie");
+  const [chartType, setChartType] = useState<ChartType2D>("pie");
   const [chartSource, setChartSource] = useState<ChartSource>("results");
   const [assistantCharts, setAssistantCharts] = useState<AssistantChartItem[]>(
     []
   );
+  const [assistantTables, setAssistantTables] = useState<AssistantTableItem[]>(
+    []
+  );
+  const [assistantFilesSortBy, setAssistantFilesSortBy] = useState<AssistantFileSortBy>("path");
+  const [assistantFilesSortDesc, setAssistantFilesSortDesc] = useState<boolean>(false);
   const [ocrMaxPages, setOcrMaxPages] = useState<number>(
     DEFAULT_OCR_MAX_PAGES
   );
@@ -1200,11 +1265,16 @@ export default function Home() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
   const [indexProgress, setIndexProgress] = useState<LoadProgress | null>(null);
   const [contextFilter, setContextFilter] = useState<string>("");
+  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+  const [themeLoaded, setThemeLoaded] = useState(false);
   const [contextSortBy, setContextSortBy] = useState<"name" | "lines" | "size" | "modified">("name");
   const [contextSortDesc, setContextSortDesc] = useState(false);
   const [sambaSortBy, setSambaSortBy] = useState<"name" | "lines" | "size" | "modified">("name");
   const [sambaSortDesc, setSambaSortDesc] = useState(false);
   const [sambaAddFilter, setSambaAddFilter] = useState<string>("");
+  const [fileFilter, setFileFilter] = useState<string>("");
+  const [fileSortBy, setFileSortBy] = useState<"name" | "lines" | "size">("name");
+  const [fileSortDesc, setFileSortDesc] = useState(false);
   const [uiLoadLimit, setUiLoadLimit] = useState<number>(200);
   const [uiLoadCacheOnly, setUiLoadCacheOnly] = useState<boolean>(true);
   const [dbIndexStatus, setDbIndexStatus] = useState<{
@@ -1244,6 +1314,79 @@ export default function Home() {
     contextSize: number;
   } | null>(null);
   const [contextDisplayCount, setContextDisplayCount] = useState(500);
+
+  const chatSuggestions = useMemo(() => {
+    const ok = chatHistory.filter((x) => x.ok);
+    const base = ok.length > 0 ? ok : chatHistory;
+    return base.slice(0, 5);
+  }, [chatHistory]);
+
+  const chatHistoryStorageKey = (word: string) => `nai.chatHistory.v1.${word}`;
+
+  const loadChatHistoryForWord = (word: string): ChatHistoryItem[] => {
+    if (typeof window === "undefined" || word.length < 5) return [];
+    try {
+      const raw = window.localStorage.getItem(chatHistoryStorageKey(word));
+      if (!raw) return [];
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      const items = parsed
+        .map((x) => {
+          const obj = x as Partial<ChatHistoryItem>;
+          return {
+            id: typeof obj.id === "string" ? obj.id : generateUUID(),
+            q: typeof obj.q === "string" ? obj.q : "",
+            ok: Boolean(obj.ok),
+            ts: typeof obj.ts === "number" ? obj.ts : Date.now(),
+          } satisfies ChatHistoryItem;
+        })
+        .filter((x) => x.q.trim().length > 0)
+        .sort((a, b) => b.ts - a.ts)
+        .slice(0, 5);
+      return items;
+    } catch {
+      return [];
+    }
+  };
+
+  const persistChatHistoryForWord = (word: string, items: ChatHistoryItem[]) => {
+    if (typeof window === "undefined" || word.length < 5) return;
+    try {
+      window.localStorage.setItem(chatHistoryStorageKey(word), JSON.stringify(items));
+    } catch {
+      // ignore storage errors
+    }
+  };
+
+  const recordChatQueryStart = (word: string, q: string): string | null => {
+    if (typeof window === "undefined" || word.length < 5) return null;
+    const query = q.trim();
+    if (!query) return null;
+    const id = generateUUID();
+    setChatHistory((prev) => {
+      const next: ChatHistoryItem[] = [
+        { id, q: query, ok: false, ts: Date.now() },
+        ...prev.filter((x) => x.q !== query),
+      ]
+        .sort((a, b) => b.ts - a.ts)
+        .slice(0, 5);
+      persistChatHistoryForWord(word, next);
+      return next;
+    });
+    return id;
+  };
+
+  const finalizeChatQuery = (word: string, id: string | null, ok: boolean) => {
+    if (typeof window === "undefined" || word.length < 5 || !id) return;
+    setChatHistory((prev) => {
+      const next = prev
+        .map((x) => (x.id === id ? { ...x, ok } : x))
+        .sort((a, b) => b.ts - a.ts)
+        .slice(0, 5);
+      persistChatHistoryForWord(word, next);
+      return next;
+    });
+  };
 
   const loadSecretWordSettings = (word: string): SecretWordSettings => {
     if (typeof window === "undefined" || word.length < 5) {
@@ -1522,6 +1665,68 @@ export default function Home() {
     
     return sorted.slice(0, 200); // Show first 200
   }, [sambaFiles, sambaFilter, sambaMaxDays, sambaSortBy, sambaSortDesc]);
+
+  // Filter and sort local files
+  const displayedFiles = useMemo(() => {
+    let filtered = files;
+    
+    // Filter by filename
+    if (fileFilter.trim()) {
+      const searchLower = fileFilter.toLowerCase();
+      filtered = filtered.filter(f => 
+        f.path.toLowerCase().includes(searchLower)
+      );
+    }
+    
+    // Sort
+    const sorted = [...filtered];
+    sorted.sort((a, b) => {
+      let comparison = 0;
+      
+      switch (fileSortBy) {
+        case "name":
+          const nameA = a.path.toLowerCase();
+          const nameB = b.path.toLowerCase();
+          comparison = nameA.localeCompare(nameB);
+          break;
+        case "lines":
+          // Local files don't have line counts, treat as equal
+          comparison = 0;
+          break;
+        case "size":
+          comparison = (a.size || 0) - (b.size || 0);
+          break;
+      }
+      
+      return fileSortDesc ? -comparison : comparison;
+    });
+    
+    return sorted;
+  }, [files, fileFilter, fileSortBy, fileSortDesc]);
+
+  // Theme initialization from localStorage (hydration-safe)
+  useEffect(() => {
+    if (typeof window === 'undefined' || themeLoaded) return;
+    const saved = window.localStorage.getItem('nai.theme');
+    const loadedTheme = (saved === 'dark' || saved === 'light') ? saved : 'light';
+    setTheme(loadedTheme);
+    setThemeLoaded(true);
+  }, [themeLoaded]);
+
+  // Theme handling
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.body.className = document.body.className
+      .split(' ')
+      .filter(c => c !== 'light-theme' && c !== 'dark-theme')
+      .concat(`${theme}-theme`)
+      .join(' ');
+    
+    // Save to localStorage
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('nai.theme', theme);
+    }
+  }, [theme]);
 
   // Simple voice-to-text initialization
   useEffect(() => {
@@ -2126,6 +2331,39 @@ export default function Home() {
       `Nalezeno ${matches.length} souborů. ${searchMode.toUpperCase()} mód. ${parts.join(" | ")}`
     );
     setIsSearching(false);
+  };
+
+  const handleDownloadAllFiles = async () => {
+    if (displayedFiles.length === 0) {
+      setStatus("Žádné soubory k stažení.");
+      return;
+    }
+
+    // Download each file
+    let downloaded = 0;
+    for (const entry of displayedFiles) {
+      try {
+        if (entry.file) {
+          // Use File API to download
+          const url = URL.createObjectURL(entry.file);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = entry.file.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          downloaded++;
+          
+          // Small delay to avoid overwhelming the browser
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      } catch (error) {
+        console.error(`Failed to download ${entry.path}:`, error);
+      }
+    }
+    
+    setStatus(`Staženo ${downloaded} souborů.`);
   };
 
   const toggleSelected = (path: string) => {
@@ -2871,6 +3109,15 @@ export default function Home() {
     setSecretWordSettings(loadSecretWordSettings(secretWord));
   }, [secretWord]);
 
+  // Load chat history for current secret word from localStorage
+  useEffect(() => {
+    if (typeof window === "undefined" || secretWord.length < 5) {
+      setChatHistory([]);
+      return;
+    }
+    setChatHistory(loadChatHistoryForWord(secretWord));
+  }, [secretWord]);
+
   const handleDeleteSecretWord = async () => {
     if (!secretWord || secretWord.length < 5) return;
     
@@ -3115,6 +3362,8 @@ export default function Home() {
     setStatus(null);
     setMessages((prev) => [...prev, { role: "user", text: trimmed }]);
     setChatInput("");
+    const historyId = recordChatQueryStart(secretWord, trimmed);
+    let chatOk = true;
     let didTimeout = false;
     try {
       const asksWhatDataWeHave =
@@ -3475,9 +3724,10 @@ export default function Home() {
       }
 
       // Přímá otázka na počet souborů v kontextu (lokální odpověď, respektuje filtr)
+      // Flexible pattern to catch typos like "koliok", "soubpru", "souboru", "soubory"
       const isContextFileCountQuestion =
-        /\bkolik\b/i.test(trimmed) &&
-        /soubor/i.test(trimmed) &&
+        /\bkoli\w*/i.test(trimmed) &&
+        /\bsoub\w*/i.test(trimmed) &&
         /kontext/i.test(trimmed);
 
       if (isContextFileCountQuestion) {
@@ -3685,8 +3935,19 @@ export default function Home() {
         controller.abort();
       }, CHAT_REQUEST_TIMEOUT_MS);
 
-      // Use indexed search if available, otherwise fall back to direct gemini
-      const endpoint = hasDbIndex ? "/api/search" : "/api/gemini";
+      // Check if UI filter is active
+      const hasActiveFilter = contextFilter.trim().length > 0 && filteredContext.length !== fileContext.length;
+      
+      // Use indexed search ONLY if available AND no active UI filter
+      // When filter is active, user explicitly wants to work with specific files
+      const useIndexedSearch = hasDbIndex && !hasActiveFilter;
+      const endpoint = useIndexedSearch ? "/api/search" : "/api/gemini";
+      
+      console.log(`[Chat] Endpoint: ${endpoint}, Reason: ${
+        !hasDbIndex ? 'no index available' : 
+        hasActiveFilter ? `UI filter active (${filteredContext.length}/${fileContext.length} files)` :
+        'using indexed search'
+      }`);
       
       // Build body with filtering info
       const filteredContextToUse = filteredContext.length > 0 ? buildContext(filteredContext) : buildContext(fileContext);
@@ -3697,7 +3958,7 @@ export default function Home() {
       const contextSizeBytes = filteredContextToUse.length;
       
       const body =
-        hasDbIndex
+        useIndexedSearch
           ? JSON.stringify({ 
               query: trimmed, 
               secretWord: secretWord || undefined
@@ -3736,6 +3997,7 @@ export default function Home() {
       
       // Handle data size warning (202 Accepted)
       if (response.status === 202 && data.warning) {
+        chatOk = false;
         // Store pending request info for potential retry
         setPendingChatRequest({
           message: trimmed,
@@ -3787,6 +4049,16 @@ export default function Home() {
       }
       processedText = textAfterChart;
       
+      // Extract table
+      const { cleanText: textAfterTable, table } = extractTableBlock(processedText);
+      if (table) {
+        setAssistantTables((prev) => [
+          ...prev,
+          { ...table, id: generateUUID() },
+        ]);
+      }
+      processedText = textAfterTable;
+      
       // Extract structured results
       const { cleanText: finalText, structured } = extractStructuredBlock(processedText);
       if (structured) {
@@ -3799,6 +4071,7 @@ export default function Home() {
         { role: "assistant", text: finalText || data.text || "" },
       ]);
     } catch (error) {
+      chatOk = false;
       setMessages((prev) => [
         ...prev,
         {
@@ -3814,6 +4087,7 @@ export default function Home() {
         },
       ]);
     } finally {
+      finalizeChatQuery(secretWord, historyId, chatOk);
       setIsSending(false);
     }
   };
@@ -3848,10 +4122,107 @@ export default function Home() {
     return items;
   }, [structuredResult, lastSearchSources]);
 
+  const sortedAssistantFiles = useMemo(() => {
+    const items = [...assistantAllFiles];
+    const dir = assistantFilesSortDesc ? -1 : 1;
+    const compareString = (a: string, b: string) => a.localeCompare(b, "cs", { sensitivity: "base" });
+
+    items.sort((a, b) => {
+      if (assistantFilesSortBy === "path") {
+        return dir * compareString(a.path, b.path);
+      }
+      if (assistantFilesSortBy === "description") {
+        return dir * compareString(a.description ?? "", b.description ?? "");
+      }
+      if (assistantFilesSortBy === "lines") {
+        return dir * ((a.lineCount ?? 0) - (b.lineCount ?? 0));
+      }
+      if (assistantFilesSortBy === "size") {
+        return dir * ((a.fileSize ?? 0) - (b.fileSize ?? 0));
+      }
+      return 0;
+    });
+    return items;
+  }, [assistantAllFiles, assistantFilesSortBy, assistantFilesSortDesc]);
+
+  const assistantSelectedCount = useMemo(() => {
+    if (assistantAllFiles.length === 0) return 0;
+    let count = 0;
+    for (const f of assistantAllFiles) {
+      if (selectedPaths.has(f.path)) count += 1;
+    }
+    return count;
+  }, [assistantAllFiles, selectedPaths]);
+
+  const assistantAllSelected = useMemo(() => {
+    return assistantAllFiles.length > 0 && assistantSelectedCount === assistantAllFiles.length;
+  }, [assistantAllFiles.length, assistantSelectedCount]);
+
+  const formatBytes = (bytes?: number) => {
+    if (!bytes || bytes <= 0) return "-";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
+
+  const toggleAssistantSort = (next: AssistantFileSortBy) => {
+    if (assistantFilesSortBy === next) {
+      setAssistantFilesSortDesc((prev) => !prev);
+      return;
+    }
+    setAssistantFilesSortBy(next);
+    setAssistantFilesSortDesc(false);
+  };
+
+  const handleDownloadSelectedAssistantFiles = async () => {
+    const paths = assistantAllFiles.filter((f) => selectedPaths.has(f.path)).map((f) => f.path);
+    if (paths.length === 0) return;
+    setStatus(`Balím ${paths.length} souborů do ZIP...`);
+    try {
+      const res = await fetch("/api/download/zip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths, zipName: secretWord?.length >= 5 ? `oznacene-${secretWord}` : "oznacene" }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(data?.error ?? "ZIP download failed.");
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "oznacene.zip";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setStatus(`✓ Staženo: ${paths.length} souborů (ZIP).`);
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : "ZIP download failed.");
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <main className="mx-auto flex w-full max-w-[1600px] flex-col gap-10 px-6 py-12">
-        <header className="flex flex-col gap-4">
+        <header className="flex flex-col gap-4 relative">
+          {/* Theme toggle button */}
+          {themeLoaded && (
+          <button
+            onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+            suppressHydrationWarning
+            className={`absolute top-0 right-0 p-2 rounded-lg transition shadow-md text-xl ${
+              theme === 'light' 
+                ? 'bg-slate-700 hover:bg-slate-600 text-yellow-300' 
+                : 'bg-slate-800 hover:bg-slate-700 text-orange-400'
+            }`}
+            title={theme === 'light' ? 'Přepnout na tmavý režim' : 'Přepnout na světlý režim'}
+          >
+            {theme === 'light' ? '🌙' : '☀️'}
+          </button>
+          )}
           <p className="text-sm uppercase tracking-[0.3em] text-slate-400">
             {/* Jardovo hledání */}
             Jardovo hledání
@@ -4089,11 +4460,12 @@ export default function Home() {
         )}
 
         {/* File Selection Section */}
-        {secretWord.length >= 5 && (
         <section className="grid gap-6 rounded-3xl border-2 border-blue-800 bg-slate-900/80 p-6">
           <div className="flex items-center justify-between border-b border-blue-700 pb-4 mb-2">
             <h2 className="text-xl font-bold text-blue-200">📁 Výběr souborů</h2>
-            <p className="text-xs text-slate-400">Pro slovo: <span className="font-mono text-blue-300">{secretWord}</span></p>
+            {secretWord.length >= 5 && (
+              <p className="text-xs text-slate-400">Pro slovo: <span className="font-mono text-blue-300">{secretWord}</span></p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <button
@@ -4318,6 +4690,119 @@ export default function Home() {
             </label>
           </div>
           )}
+
+          {/* Lokální soubory - tabulka */}
+          {files.length > 0 && (
+            <div className="flex flex-col gap-3 rounded-2xl border border-slate-700 bg-slate-900/40 p-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-slate-200">
+                  Soubory ({displayedFiles.length})
+                </h3>
+                <button
+                  onClick={handleDownloadAllFiles}
+                  disabled={displayedFiles.length === 0}
+                  className="px-3 py-1 text-xs rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold disabled:opacity-50 transition"
+                >
+                  📥 Stáhnout vše
+                </button>
+              </div>
+              
+              {/* Filtr */}
+              <input
+                className="w-full text-xs rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-200 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none"
+                placeholder="Filtr souborů (např. .xlsx, 2019)"
+                value={fileFilter}
+                onChange={(e) => setFileFilter(e.target.value)}
+              />
+              
+              {/* Tabulka */}
+              <div className="max-h-[60vh] overflow-auto border border-slate-700 rounded-lg">
+                {displayedFiles.length === 0 ? (
+                  <p className="text-slate-500 p-4 text-xs">Žádné soubory odpovídající filtru.</p>
+                ) : (
+                  <table className="w-full border-collapse bg-white text-slate-900 text-xs">
+                    <thead className="sticky top-0 bg-slate-100 border-b-2 border-slate-300">
+                      <tr>
+                        <th 
+                          className="text-center py-2 px-2 text-slate-700 font-semibold w-8 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
+                          title="Index"
+                        >
+                          #
+                        </th>
+                        <th 
+                          className="text-left py-2 px-3 text-slate-700 font-semibold border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
+                          onClick={() => {
+                            if (fileSortBy === "name") {
+                              setFileSortDesc(!fileSortDesc);
+                            } else {
+                              setFileSortBy("name");
+                              setFileSortDesc(false);
+                            }
+                          }}
+                        >
+                          Soubor {fileSortBy === "name" && (fileSortDesc ? "↓" : "↑")}
+                        </th>
+                        <th 
+                          className="text-right py-2 px-3 text-slate-700 font-semibold w-20 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
+                          onClick={() => {
+                            if (fileSortBy === "lines") {
+                              setFileSortDesc(!fileSortDesc);
+                            } else {
+                              setFileSortBy("lines");
+                              setFileSortDesc(false);
+                            }
+                          }}
+                        >
+                          Řádky {fileSortBy === "lines" && (fileSortDesc ? "↓" : "↑")}
+                        </th>
+                        <th 
+                          className="text-right py-2 px-3 text-slate-700 font-semibold w-24 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
+                          onClick={() => {
+                            if (fileSortBy === "size") {
+                              setFileSortDesc(!fileSortDesc);
+                            } else {
+                              setFileSortBy("size");
+                              setFileSortDesc(false);
+                            }
+                          }}
+                        >
+                          Velikost {fileSortBy === "size" && (fileSortDesc ? "↓" : "↑")}
+                        </th>
+                        <th className="text-left py-2 px-3 text-slate-700 font-semibold border border-slate-300">
+                          Popis
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayedFiles.map((entry, idx) => (
+                        <tr key={entry.path} className={idx % 2 === 0 ? "bg-white" : "bg-slate-50"}>
+                          <td className="text-center py-2 px-2 border border-slate-300 text-slate-600">
+                            {idx + 1}
+                          </td>
+                          <td className="text-left py-2 px-3 border border-slate-300 text-slate-700 truncate" title={entry.path}>
+                            {entry.path.split("/").pop() || entry.path}
+                          </td>
+                          <td className="text-right py-2 px-3 border border-slate-300 text-slate-700">
+                            —
+                          </td>
+                          <td className="text-right py-2 px-3 border border-slate-300 text-slate-700">
+                            {entry.size ? (entry.size < 1024 ? `${entry.size}B` : entry.size < 1024*1024 ? `${(entry.size/1024).toFixed(1)}KB` : `${(entry.size/(1024*1024)).toFixed(1)}MB`) : "0B"}
+                          </td>
+                          <td className="text-left py-2 px-3 border border-slate-300 text-slate-600">
+                            —
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* HLEDÁNÍ V SOUBORECH */}
+        <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-1 text-[11px] text-slate-500">
               <span>Syntaxe: čárkou, <code className="bg-slate-800 px-1 rounded">!</code> = vyloučit, <code className="bg-slate-800 px-1 rounded">*</code> = vše. Př.: <code className="bg-slate-800 px-1 rounded">*, !eon</code> nebo <code className="bg-slate-800 px-1 rounded">docx, smlouva, !archiv</code></span>
@@ -4480,21 +4965,28 @@ export default function Home() {
                     onChange={(e) => setContextFilter(e.target.value)}
                   />
                   {filteredContext.length !== fileContext.length && (
-                    <p className="mt-1 text-[11px] text-slate-500">
-                      Filtrováno: {filteredContext.length} / {fileContext.length}
-                    </p>
+                    <div className="mt-1 text-[11px] space-y-0.5">
+                      <p className="text-slate-500">
+                        Filtrováno: {filteredContext.length} / {fileContext.length}
+                      </p>
+                      {knowledgeBase?.readyForSearch && (
+                        <p className="text-amber-400">
+                          ⚠️ Aktivní filtr → pracuji s lokálním kontextem (bez indexu)
+                        </p>
+                      )}
+                    </div>
                   )}
                 </div>
-                <div className="mt-3 max-h-96 overflow-auto text-xs">
+                <div className="mt-3 max-h-[60vh] overflow-auto border border-slate-700 rounded-lg">
                   {fileContext.length === 0 && (
                     <p className="text-slate-500 p-4">Žádné soubory v kontextu.</p>
                   )}
                   {displayedContext.length > 0 && (
-                    <table className="w-full border-collapse">
-                      <thead className="sticky top-0 bg-slate-950 border-b border-slate-700">
+                    <table className="w-full border-collapse bg-white text-slate-900 text-xs">
+                      <thead className="sticky top-0 bg-slate-100 border-b-2 border-slate-300">
                         <tr>
                           <th 
-                            className="text-left py-2 px-3 text-slate-400 font-medium cursor-pointer hover:text-slate-200 transition"
+                            className="text-left py-2 px-3 text-slate-700 font-semibold border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                             onClick={() => {
                               if (contextSortBy === "name") {
                                 setContextSortDesc(!contextSortDesc);
@@ -4508,7 +5000,7 @@ export default function Home() {
                             Název souboru {contextSortBy === "name" && (contextSortDesc ? "↓" : "↑")}
                           </th>
                           <th 
-                            className="text-right py-2 px-3 text-slate-400 font-medium w-16 cursor-pointer hover:text-slate-200 transition"
+                            className="text-right py-2 px-3 text-slate-700 font-semibold w-16 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                             onClick={() => {
                               if (contextSortBy === "lines") {
                                 setContextSortDesc(!contextSortDesc);
@@ -4522,7 +5014,7 @@ export default function Home() {
                             Řádky {contextSortBy === "lines" && (contextSortDesc ? "↓" : "↑")}
                           </th>
                           <th 
-                            className="text-right py-2 px-3 text-slate-400 font-medium w-20 cursor-pointer hover:text-slate-200 transition"
+                            className="text-right py-2 px-3 text-slate-700 font-semibold w-20 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                             onClick={() => {
                               if (contextSortBy === "size") {
                                 setContextSortDesc(!contextSortDesc);
@@ -4536,7 +5028,7 @@ export default function Home() {
                             Velikost {contextSortBy === "size" && (contextSortDesc ? "↓" : "↑")}
                           </th>
                           <th 
-                            className="text-right py-2 px-3 text-slate-400 font-medium w-32 cursor-pointer hover:text-slate-200 transition"
+                            className="text-right py-2 px-3 text-slate-700 font-semibold w-36 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                             onClick={() => {
                               if (contextSortBy === "modified") {
                                 setContextSortDesc(!contextSortDesc);
@@ -4547,38 +5039,40 @@ export default function Home() {
                             }}
                             title="Klikni pro třídění"
                           >
-                            Změna {contextSortBy === "modified" && (contextSortDesc ? "↓" : "↑")}
+                            Datum {contextSortBy === "modified" && (contextSortDesc ? "↓" : "↑")}
                           </th>
-                          <th className="text-right py-2 px-3 text-slate-400 font-medium w-12"></th>
+                          <th className="text-center py-2 px-3 text-slate-700 font-semibold w-12 border border-slate-300"></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {displayedContext.map((item) => (
-                          <tr key={item.path} className="border-b border-slate-800 hover:bg-slate-900/60 transition">
-                            <td className="py-2 px-3">
-                              <span className="text-slate-200 truncate block" title={item.path}>
+                        {displayedContext.map((item, idx) => (
+                          <tr key={item.path} className={`border border-slate-300 hover:bg-slate-200 transition ${idx % 2 === 0 ? 'bg-white' : 'bg-slate-50'}`}>
+                            <td className="py-2 px-3 border border-slate-300">
+                              <span className="text-slate-900 font-medium truncate block" title={item.path}>
                                 {item.path.split('/').pop() || item.path}
                               </span>
-                              <span className="text-[10px] text-slate-600 block">{item.path}</span>
+                              <span className="text-[10px] text-slate-500 block truncate">{item.path}</span>
                             </td>
-                            <td className="text-right py-2 px-3 text-slate-300 font-mono">
+                            <td className="text-right py-2 px-3 text-slate-800 font-mono border border-slate-300">
                               {item.lineCount?.toLocaleString('cs-CZ') || '-'}
                             </td>
-                            <td className="text-right py-2 px-3 text-slate-300 font-mono">
+                            <td className="text-right py-2 px-3 text-slate-800 font-mono border border-slate-300">
                               {((item.size || 0) / 1024).toFixed(1)} KB
                             </td>
-                            <td className="text-right py-2 px-3 text-slate-400 text-[11px]">
-                              {item.modified ? new Date(item.modified).toLocaleString('cs-CZ', { 
-                                year: 'numeric', 
-                                month: '2-digit', 
-                                day: '2-digit',
-                                hour: '2-digit',
-                                minute: '2-digit'
-                              }) : '-'}
+                            <td className="text-right py-2 px-3 text-slate-700 font-mono border border-slate-300">
+                              {item.modified ? (() => {
+                                const d = new Date(item.modified);
+                                const yyyy = d.getFullYear();
+                                const mm = String(d.getMonth() + 1).padStart(2, '0');
+                                const dd = String(d.getDate()).padStart(2, '0');
+                                const hh = String(d.getHours()).padStart(2, '0');
+                                const min = String(d.getMinutes()).padStart(2, '0');
+                                return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+                              })() : '-'}
                             </td>
-                            <td className="text-right py-2 px-3">
+                            <td className="text-center py-2 px-3 border border-slate-300">
                               <button
-                                className="text-rose-400 hover:text-rose-300 transition text-xs"
+                                className="text-rose-600 hover:text-rose-700 font-bold transition text-sm"
                                 onClick={() => handleRemoveContext(item.path)}
                                 title="Odebrat"
                               >
@@ -4667,7 +5161,7 @@ export default function Home() {
                     )}
                     {loadProgress && (
                       <button
-                        className="text-xs px-2 py-1 rounded bg-rose-900 hover:bg-rose-800 text-rose-200 transition"
+                        className="text-sm px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-md transition"
                         onClick={() => {
                           if (addFilesAbortRef.current) {
                             addFilesAbortRef.current.abort();
@@ -4679,7 +5173,7 @@ export default function Home() {
                     )}
                     {sambaFiles.filter((f) => f.type === "file").length > 0 && !loadProgress && (
                       <button
-                        className="text-xs px-2 py-1 rounded bg-emerald-900 hover:bg-emerald-800 text-emerald-200"
+                        className="text-sm px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold shadow-md transition"
                         onClick={handleAddAllSambaToContext}
                       >
                         + Add All
@@ -4743,19 +5237,19 @@ export default function Home() {
                           )}
                         </p>
                       )}
-                      <div className="mt-3 max-h-96 overflow-auto text-xs">
+                      <div className="mt-3 max-h-[60vh] overflow-auto border border-slate-700 rounded-lg">
                         {filtered.length === 0 && allFiles.length > 0 && (
-                          <p className="text-xs text-slate-500">Žádné soubory neodpovídají filtru.</p>
+                          <p className="text-xs text-slate-500 p-4">Žádné soubory neodpovídají filtru.</p>
                         )}
                         {filtered.length === 0 && allFiles.length === 0 && (
-                          <p className="text-xs text-slate-500">Klikněte "Prohledat úložiště" pro načtení souborů.</p>
+                          <p className="text-xs text-slate-500 p-4">Klikněte "Prohledat úložiště" pro načtení souborů.</p>
                         )}
                         {displayedSambaFiles.length > 0 && (
-                          <table className="w-full border-collapse">
-                            <thead className="sticky top-0 bg-slate-950 border-b border-slate-700">
+                          <table className="w-full border-collapse bg-white text-slate-900 text-xs">
+                            <thead className="sticky top-0 bg-slate-100 border-b-2 border-slate-300">
                               <tr>
                                 <th 
-                                  className="text-left py-2 px-3 text-slate-400 font-medium cursor-pointer hover:text-slate-200 transition"
+                                  className="text-left py-2 px-3 text-slate-700 font-semibold border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                                   onClick={() => {
                                     if (sambaSortBy === "name") {
                                       setSambaSortDesc(!sambaSortDesc);
@@ -4769,7 +5263,7 @@ export default function Home() {
                                   Název souboru {sambaSortBy === "name" && (sambaSortDesc ? "↓" : "↑")}
                                 </th>
                                 <th 
-                                  className="text-right py-2 px-3 text-slate-400 font-medium w-20 cursor-pointer hover:text-slate-200 transition"
+                                  className="text-right py-2 px-3 text-slate-700 font-semibold w-20 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                                   onClick={() => {
                                     if (sambaSortBy === "size") {
                                       setSambaSortDesc(!sambaSortDesc);
@@ -4783,7 +5277,7 @@ export default function Home() {
                                   Velikost {sambaSortBy === "size" && (sambaSortDesc ? "↓" : "↑")}
                                 </th>
                                 <th 
-                                  className="text-right py-2 px-3 text-slate-400 font-medium w-32 cursor-pointer hover:text-slate-200 transition"
+                                  className="text-right py-2 px-3 text-slate-700 font-semibold w-36 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                                   onClick={() => {
                                     if (sambaSortBy === "modified") {
                                       setSambaSortDesc(!sambaSortDesc);
@@ -4794,35 +5288,37 @@ export default function Home() {
                                   }}
                                   title="Klikni pro třídění"
                                 >
-                                  Změna {sambaSortBy === "modified" && (sambaSortDesc ? "↓" : "↑")}
+                                  Datum {sambaSortBy === "modified" && (sambaSortDesc ? "↓" : "↑")}
                                 </th>
-                                <th className="text-right py-2 px-3 text-slate-400 font-medium w-12"></th>
+                                <th className="text-center py-2 px-3 text-slate-700 font-semibold w-12 border border-slate-300"></th>
                               </tr>
                             </thead>
                             <tbody>
-                              {displayedSambaFiles.map((file) => (
-                                <tr key={file.path} className="border-b border-slate-800 hover:bg-slate-900/60 transition">
-                                  <td className="py-2 px-3">
-                                    <span className="text-slate-200 truncate block" title={file.path}>
+                              {displayedSambaFiles.map((file, idx) => (
+                                <tr key={file.path} className={`border border-slate-300 hover:bg-slate-200 transition ${idx % 2 === 0 ? 'bg-white' : 'bg-slate-50'}`}>
+                                  <td className="py-2 px-3 border border-slate-300">
+                                    <span className="text-slate-900 font-medium truncate block" title={file.path}>
                                       {file.name}
                                     </span>
-                                    <span className="text-[10px] text-slate-600 block">{file.path}</span>
+                                    <span className="text-[10px] text-slate-500 block truncate">{file.path}</span>
                                   </td>
-                                  <td className="text-right py-2 px-3 text-slate-300 font-mono">
+                                  <td className="text-right py-2 px-3 text-slate-800 font-mono border border-slate-300">
                                     {((file.size || 0) / 1024).toFixed(1)} KB
                                   </td>
-                                  <td className="text-right py-2 px-3 text-slate-400 text-[11px]">
-                                    {file.modified ? new Date(file.modified).toLocaleString('cs-CZ', { 
-                                      year: 'numeric', 
-                                      month: '2-digit', 
-                                      day: '2-digit',
-                                      hour: '2-digit',
-                                      minute: '2-digit'
-                                    }) : '-'}
+                                  <td className="text-right py-2 px-3 text-slate-700 font-mono border border-slate-300">
+                                    {file.modified ? (() => {
+                                      const d = new Date(file.modified);
+                                      const yyyy = d.getFullYear();
+                                      const mm = String(d.getMonth() + 1).padStart(2, '0');
+                                      const dd = String(d.getDate()).padStart(2, '0');
+                                      const hh = String(d.getHours()).padStart(2, '0');
+                                      const min = String(d.getMinutes()).padStart(2, '0');
+                                      return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+                                    })() : '-'}
                                   </td>
-                                  <td className="text-right py-2 px-3">
+                                  <td className="text-center py-2 px-3 border border-slate-300">
                                     <button
-                                      className="text-emerald-400 hover:text-emerald-300 transition text-xs"
+                                      className="text-emerald-600 hover:text-emerald-700 font-bold transition text-sm"
                                       onClick={() => handleAddSambaToContext(file.path)}
                                       title="Přidat do kontextu"
                                     >
@@ -4857,13 +5353,13 @@ export default function Home() {
               >
                 Přidat vybrané soubory do kontextu
               </button>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-col gap-2">
                 <button
-                  className={`rounded-2xl px-4 py-2 text-sm font-semibold ${
+                  className={`w-full rounded-2xl px-4 py-2 text-sm font-semibold ${
                     isIndexed
-                      ? "bg-blue-500 text-white"
-                      : "bg-amber-500 text-slate-900"
-                  } disabled:opacity-60`}
+                      ? "bg-blue-600 text-white hover:bg-blue-700"
+                      : "bg-amber-600 text-white hover:bg-amber-700"
+                  } disabled:opacity-60 transition shadow-md`}
                   onClick={handleIndexFiles}
                   disabled={fileContext.length === 0 || isIndexing || isRebuilding}
                 >
@@ -4875,7 +5371,7 @@ export default function Home() {
                 </button>
                 {isIndexing && (
                   <button
-                    className="rounded-2xl border border-rose-500/60 px-4 py-2 text-sm font-semibold text-rose-200 hover:bg-rose-500/10 transition"
+                    className="w-full rounded-2xl bg-rose-600 hover:bg-rose-700 px-4 py-2 text-sm font-semibold text-white transition shadow-md"
                     onClick={() => {
                       if (indexAbortRef.current) {
                         indexAbortRef.current.abort();
@@ -4915,7 +5411,6 @@ export default function Home() {
             </div>
           </div>
         </section>
-        )}
 
         <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
           <div className="flex flex-wrap items-center gap-3 justify-between">
@@ -4935,7 +5430,7 @@ export default function Home() {
                 className="rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100"
                 value={chartType}
                 onChange={(event) =>
-                  setChartType(event.target.value as ChartType)
+                  setChartType(event.target.value as ChartType2D)
                 }
               >
                 <option value="pie">Koláčový</option>
@@ -4956,39 +5451,78 @@ export default function Home() {
           />
         </section>
 
-        <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
-          <div className="flex flex-wrap items-center gap-3 justify-between">
-            <h2 className="text-lg font-semibold">Grafy z asistenta</h2>
-            {assistantCharts.length > 0 && (
+        {/* Grafy z asistenta */}
+        {assistantCharts.length > 0 && (
+          <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold">📈 Grafy z asistenta ({assistantCharts.length})</h2>
               <button
-                className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
-                onClick={() => setAssistantCharts([])}
+                className="text-xs px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-semibold transition"
+                onClick={() => {
+                  if (confirm("Smazat všechny grafy z asistenta?")) {
+                    setAssistantCharts([]);
+                  }
+                }}
               >
                 Vymazat grafy
               </button>
-            )}
-          </div>
-          {assistantCharts.length > 0 ? (
+            </div>
             <div className="grid gap-4">
               {assistantCharts.map((chart) => (
-                <ResultsChart
-                  key={chart.id}
-                  title={chart.title}
-                  labels={chart.labels}
-                  series={chart.series}
-                  chartType={chart.type}
+                <div key={chart.id} className="rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
+                  <h3 className="text-sm font-semibold text-slate-200 mb-3">{chart.title}</h3>
+                  {chart.type === "3d" ? (
+                    <Plot3D
+                      title=""
+                      data={(chart as any).data}
+                      xLabel={(chart as any).xLabel}
+                      yLabel={(chart as any).yLabel}
+                      zLabel={(chart as any).zLabel}
+                      height={400}
+                    />
+                  ) : (
+                    <ResultsChart
+                      title=""
+                      labels={(chart as any).labels}
+                      series={(chart as any).series}
+                      chartType={(chart as any).type}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Tabulky */}
+        {assistantTables.length > 0 && (
+          <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold">Tabulky</h2>
+              <button
+                className="text-xs px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-semibold transition"
+                onClick={() => {
+                  if (confirm("Smazat všechny tabulky?")) {
+                    setAssistantTables([]);
+                  }
+                }}
+              >
+                Vymazat tabulky
+              </button>
+            </div>
+            <div className="grid gap-4">
+              {assistantTables.map((table) => (
+                <DataTable
+                  key={table.id}
+                  title={table.title}
+                  headers={table.headers}
+                  rows={table.rows}
+                  id={table.id}
                 />
               ))}
             </div>
-          ) : (
-            <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
-              <p className="text-xs text-slate-500">
-                Zatím žádný graf. Zeptejte se v chatu např. „Zobraz, kolik komu
-                zbývá sick days v koláčovém grafu“.
-              </p>
-            </div>
-          )}
-        </section>
+          </section>
+        )}
 
         <section className="grid gap-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-6">
           <div className="flex flex-wrap items-center gap-3 justify-between">
@@ -5105,6 +5639,26 @@ export default function Home() {
                   value={chatInput}
                   onChange={(event) => setChatInput(event.target.value)}
                 />
+
+                {chatSuggestions.length > 0 && (
+                  <div className="md:col-span-3 flex flex-wrap items-center gap-2">
+                    <span className="text-xs text-slate-500">Našeptávač:</span>
+                    {chatSuggestions.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className="rounded-full border border-slate-700 bg-slate-900/60 px-3 py-1 text-xs text-slate-200 hover:bg-slate-800 transition"
+                        onClick={() => {
+                          setChatInput(item.q);
+                          chatInputRef.current?.focus();
+                        }}
+                        title={item.ok ? "Dříve úspěšný dotaz" : "Dřívější dotaz"}
+                      >
+                        {item.q}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 
                 <button
                   className="h-fit rounded-2xl bg-slate-100 px-5 py-3 text-sm font-semibold text-slate-900 disabled:opacity-60"
@@ -5293,12 +5847,27 @@ export default function Home() {
                         className="rounded-xl bg-emerald-500 hover:bg-emerald-600 px-4 py-2 text-sm font-semibold text-slate-900 transition"
                         onClick={() => {
                           const allPaths = assistantAllFiles.map((x) => x.path);
+                          if (assistantAllSelected) {
+                            setSelectedPaths(new Set());
+                            setStatus("Výběr zrušen.");
+                            return;
+                          }
                           setSelectedPaths(new Set(allPaths));
                           setStatus(`Vybráno ${allPaths.length} souborů`);
                         }}
                       >
-                        Vybrat všechny
+                        {assistantAllSelected ? "Zrušit výběr" : "Vybrat vše"}
                       </button>
+
+                      {assistantSelectedCount > 0 && (
+                        <button
+                          className="rounded-xl bg-slate-100 hover:bg-slate-200 px-4 py-2 text-sm font-semibold text-slate-900 transition"
+                          onClick={handleDownloadSelectedAssistantFiles}
+                          title="Zabalí označené soubory na serveru do ZIP a stáhne"
+                        >
+                          📦 Stáhnout označené ({assistantSelectedCount})
+                        </button>
+                      )}
                       {!structuredResult && lastSearchSources.length > 0 && (
                         <button
                           className="rounded-xl bg-slate-700 hover:bg-slate-600 px-4 py-2 text-sm font-semibold text-slate-100 transition"
@@ -5310,46 +5879,113 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="overflow-x-auto">
+                  <div className="max-h-[60vh] overflow-auto rounded-2xl border border-slate-800">
                     <table className="w-full text-sm">
-                      <thead>
+                      <thead className="sticky top-0 z-10 bg-slate-950">
                         <tr className="border-b border-slate-700">
-                          <th className="text-left py-2 px-3 text-slate-300 font-medium">#</th>
-                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Soubor</th>
-                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Řádky</th>
-                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Velikost</th>
-                          <th className="text-left py-2 px-3 text-slate-300 font-medium">Popis</th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium w-[72px]">
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="checkbox"
+                                className="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                                checked={assistantAllSelected}
+                                onChange={() => {
+                                  const allPaths = assistantAllFiles.map((x) => x.path);
+                                  if (assistantAllSelected) {
+                                    setSelectedPaths(new Set());
+                                  } else {
+                                    setSelectedPaths(new Set(allPaths));
+                                  }
+                                }}
+                                title={assistantAllSelected ? "Zrušit výběr" : "Vybrat vše"}
+                              />
+                              <button
+                                type="button"
+                                className="hover:underline"
+                                onClick={() => toggleAssistantSort("path")}
+                                title="Třídit"
+                              >
+                                #
+                              </button>
+                            </div>
+                          </th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium">
+                            <button
+                              type="button"
+                              className="hover:underline"
+                              onClick={() => toggleAssistantSort("path")}
+                              title="Třídit podle souboru"
+                            >
+                              Soubor
+                            </button>
+                          </th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium w-[120px]">
+                            <button
+                              type="button"
+                              className="hover:underline"
+                              onClick={() => toggleAssistantSort("lines")}
+                              title="Třídit podle řádků"
+                            >
+                              Řádky
+                            </button>
+                          </th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium w-[140px]">
+                            <button
+                              type="button"
+                              className="hover:underline"
+                              onClick={() => toggleAssistantSort("size")}
+                              title="Třídit podle velikosti"
+                            >
+                              Velikost
+                            </button>
+                          </th>
+                          <th className="text-left py-2 px-3 text-slate-300 font-medium">
+                            <button
+                              type="button"
+                              className="hover:underline"
+                              onClick={() => toggleAssistantSort("description")}
+                              title="Třídit podle popisu"
+                            >
+                              Popis
+                            </button>
+                          </th>
                         </tr>
                       </thead>
                       <tbody>
-                        {assistantAllFiles.map((file, idx) => {
-                          const formatSize = (bytes?: number) => {
-                            if (!bytes || bytes <= 0) return "-";
-                            if (bytes < 1024) return `${bytes} B`;
-                            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-                            if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-                            return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-                          };
-                          
-                          return (
-                            <tr key={`${file.path}-${idx}`} className="border-b border-slate-800 hover:bg-slate-900/50">
-                              <td className="py-2 px-3 text-slate-400">{idx + 1}</td>
-                              <td className="py-2 px-3">
-                                <a
-                                  className="text-emerald-400 hover:text-emerald-300 hover:underline text-left break-all"
-                                  href={`/api/download?path=${encodeURIComponent(file.path)}`}
-                                  title="Stáhnout soubor"
-                                >
-                                  {file.path.split("/").pop() || file.path}
-                                </a>
-                                <div className="text-xs text-slate-500 mt-1">{file.path}</div>
-                              </td>
-                              <td className="py-2 px-3 text-slate-400">{file.lineCount ? `${file.lineCount.toLocaleString("cs-CZ")}` : "-"}</td>
-                              <td className="py-2 px-3 text-slate-400">{formatSize(file.fileSize)}</td>
-                              <td className="py-2 px-3 text-slate-300">{file.description || "-"}</td>
-                            </tr>
-                          );
-                        })}
+                        {sortedAssistantFiles.map((file, idx) => (
+                          <tr
+                            key={`${file.path}-${idx}`}
+                            className="border-b border-slate-800 hover:bg-slate-900/50"
+                          >
+                            <td className="py-2 px-3 text-slate-400 align-top">
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  className="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                                  checked={selectedPaths.has(file.path)}
+                                  onChange={() => toggleSelected(file.path)}
+                                  title="Označit"
+                                />
+                                <span className="tabular-nums">{idx + 1}</span>
+                              </div>
+                            </td>
+                            <td className="py-2 px-3 align-top">
+                              <a
+                                className="text-emerald-400 hover:text-emerald-300 hover:underline text-left break-all"
+                                href={`/api/download?path=${encodeURIComponent(file.path)}`}
+                                title="Stáhnout soubor"
+                              >
+                                {file.path.split("/").pop() || file.path}
+                              </a>
+                              <div className="text-xs text-slate-500 mt-1 break-all">{file.path}</div>
+                            </td>
+                            <td className="py-2 px-3 text-slate-400 align-top">
+                              {file.lineCount ? file.lineCount.toLocaleString("cs-CZ") : "-"}
+                            </td>
+                            <td className="py-2 px-3 text-slate-400 align-top">{formatBytes(file.fileSize)}</td>
+                            <td className="py-2 px-3 text-slate-300 align-top">{file.description || "-"}</td>
+                          </tr>
+                        ))}
                       </tbody>
                     </table>
                   </div>

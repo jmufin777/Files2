@@ -6,13 +6,13 @@ const ApexChart = dynamic(() => import("react-apexcharts"), {
   ssr: false,
 });
 
-type ChartType = "pie" | "bar" | "line";
+export type ChartType2D = "pie" | "bar" | "line";
 
 type ResultsChartProps = {
   title: string;
   labels: string[];
   series: number[];
-  chartType: ChartType;
+  chartType: ChartType2D;
 };
 
 export default function ResultsChart({
