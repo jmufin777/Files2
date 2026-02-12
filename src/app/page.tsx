@@ -1173,6 +1173,8 @@ export default function Home() {
   const [lastScannedSambaPath, setLastScannedSambaPath] = useState("");
   const searchAbortRef = useRef<AbortController | null>(null);
   const sambaCancelRef = useRef<AbortController | null>(null);
+  const addFilesAbortRef = useRef<AbortController | null>(null);
+  const indexAbortRef = useRef<AbortController | null>(null);
   const directoryInputRef = useRef<HTMLInputElement | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const voiceRecogRef = useRef<SpeechRecognitionInstance | null>(null);
@@ -1198,6 +1200,11 @@ export default function Home() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
   const [indexProgress, setIndexProgress] = useState<LoadProgress | null>(null);
   const [contextFilter, setContextFilter] = useState<string>("");
+  const [contextSortBy, setContextSortBy] = useState<"name" | "lines" | "size" | "modified">("name");
+  const [contextSortDesc, setContextSortDesc] = useState(false);
+  const [sambaSortBy, setSambaSortBy] = useState<"name" | "lines" | "size" | "modified">("name");
+  const [sambaSortDesc, setSambaSortDesc] = useState(false);
+  const [sambaAddFilter, setSambaAddFilter] = useState<string>("");
   const [uiLoadLimit, setUiLoadLimit] = useState<number>(200);
   const [uiLoadCacheOnly, setUiLoadCacheOnly] = useState<boolean>(true);
   const [dbIndexStatus, setDbIndexStatus] = useState<{
@@ -1236,6 +1243,7 @@ export default function Home() {
     filteredFiles: number;
     contextSize: number;
   } | null>(null);
+  const [contextDisplayCount, setContextDisplayCount] = useState(500);
 
   const loadSecretWordSettings = (word: string): SecretWordSettings => {
     if (typeof window === "undefined" || word.length < 5) {
@@ -1284,7 +1292,7 @@ export default function Home() {
     }
   };
 
-  const applySecretWordToSambaForm = (word: string) => {
+  const applySecretWordToSambaForm = async (word: string) => {
     const merged = loadSecretWordSettings(word);
     setSecretWord(word);
     setSecretWordSettings(merged);
@@ -1300,6 +1308,51 @@ export default function Home() {
     if (nextPath.trim() !== lastScannedSambaPath) {
       setSambaFiles([]);
       setSambaStats(null);
+    }
+
+    // Auto-scan Samba (jen zobrazí soubory, bez indexace/přidání do kontextu)
+    if (nextPath.trim()) {
+      try {
+        setStatus("Skenování Samby...");
+        setIsSambaScanning(true);
+        
+        const response = await fetch("/api/samba", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sambaPath: nextPath.trim(),
+            recursive: true,
+            maxFiles: 5000,
+            nameFilter: merged.sambaFilter.trim(),
+            maxDays: merged.sambaMaxDays,
+          }),
+        });
+
+        const data = (await response.json()) as {
+          success?: boolean;
+          files?: SambaEntry[];
+          stats?: SambaStats;
+          error?: string;
+        };
+
+        if (!response.ok) {
+          throw new Error(data.error ?? "Samba scan failed.");
+        }
+
+        const files = data.files ?? [];
+        setSambaFiles(files);
+        setSambaStats(data.stats ?? null);
+        setLastScannedSambaPath(nextPath.trim());
+        
+        const fileCount = files.filter((f) => f.type === "file").length;
+        setStatus(`✓ Načteno ${fileCount} souborů z Samby (klikni "Add All" pro přidání do kontextu).`);
+      } catch (error) {
+        setStatus(
+          error instanceof Error ? error.message : "Failed to scan Samba."
+        );
+      } finally {
+        setIsSambaScanning(false);
+      }
     }
   };
 
@@ -1374,11 +1427,101 @@ export default function Home() {
     return fileContext.filter((f) => f.path.toLowerCase().includes(q));
   }, [contextFilter, fileContext]);
 
-  const CONTEXT_DISPLAY_LIMIT = 200;
-  const displayedContext = useMemo(
-    () => filteredContext.slice(0, CONTEXT_DISPLAY_LIMIT),
-    [filteredContext]
-  );
+  const displayedContext = useMemo(() => {
+    let sorted = [...filteredContext];
+    
+    // Apply sorting
+    sorted.sort((a, b) => {
+      let comparison = 0;
+      
+      switch (contextSortBy) {
+        case "name":
+          const nameA = (a.path.split('/').pop() || a.path).toLowerCase();
+          const nameB = (b.path.split('/').pop() || b.path).toLowerCase();
+          comparison = nameA.localeCompare(nameB);
+          break;
+        case "lines":
+          comparison = (a.lineCount || 0) - (b.lineCount || 0);
+          break;
+        case "size":
+          comparison = (a.size || 0) - (b.size || 0);
+          break;
+        case "modified":
+          const timeA = a.modified ? new Date(a.modified).getTime() : 0;
+          const timeB = b.modified ? new Date(b.modified).getTime() : 0;
+          comparison = timeA - timeB;
+          break;
+      }
+      
+      return contextSortDesc ? -comparison : comparison;
+    });
+    
+    return sorted.slice(0, contextDisplayCount);
+  }, [filteredContext, contextDisplayCount, contextSortBy, contextSortDesc]);
+
+  /** Apply name filter + days filter to samba file list */
+  const filterSambaFiles = (allFiles: SambaEntry[]): SambaEntry[] => {
+    let result = allFiles;
+    // Name filter
+    const hasNameFilter = sambaFilter.trim().length > 0;
+    if (hasNameFilter) {
+      const parsed = parseSearchTerms(sambaFilter);
+      const isWild = parsed.include.length === 1 && parsed.include[0] === "*";
+      result = result.filter((f) => {
+        const text = normalizeCzech(`${String(f.path)} ${String(f.name ?? "")}`);
+        if (!isWild && parsed.include.length > 0) {
+          if (!parsed.include.every((t) => fuzzyContains(text, t))) return false;
+        }
+        if (parsed.exclude.length > 0) {
+          if (parsed.exclude.some((t) => fuzzyContains(text, t))) return false;
+        }
+        return true;
+      });
+    }
+    // Days filter
+    if (sambaMaxDays > 0) {
+      const cutoff = Date.now() - sambaMaxDays * 86_400_000;
+      result = result.filter((f) => {
+        const ts = f.modified ? new Date(f.modified).getTime() : 0;
+        return ts >= cutoff;
+      });
+    }
+    return result;
+  };
+
+  const displayedSambaFiles = useMemo(() => {
+    const allFiles = sambaFiles.filter((f) => f.type === "file");
+    const filesToSort = filterSambaFiles(allFiles);
+    
+    let sorted = [...filesToSort];
+    sorted.sort((a, b) => {
+      let comparison = 0;
+      
+      switch (sambaSortBy) {
+        case "name":
+          const nameA = (a.name || a.path).toLowerCase();
+          const nameB = (b.name || b.path).toLowerCase();
+          comparison = nameA.localeCompare(nameB);
+          break;
+        case "lines":
+          // Samba files don't have line counts, treat as equal
+          comparison = 0;
+          break;
+        case "size":
+          comparison = (a.size || 0) - (b.size || 0);
+          break;
+        case "modified":
+          const timeA = a.modified ? new Date(a.modified).getTime() : 0;
+          const timeB = b.modified ? new Date(b.modified).getTime() : 0;
+          comparison = timeA - timeB;
+          break;
+      }
+      
+      return sambaSortDesc ? -comparison : comparison;
+    });
+    
+    return sorted.slice(0, 200); // Show first 200
+  }, [sambaFiles, sambaFilter, sambaMaxDays, sambaSortBy, sambaSortDesc]);
 
   // Simple voice-to-text initialization
   useEffect(() => {
@@ -2179,18 +2322,27 @@ export default function Home() {
       setFileContext((prev) => prev.filter((item) => !changedPaths.has(item.path)));
     }
 
-    // New files (not in context) + changed files (removed above, so no longer in context)
+    // Apply sambaAddFilter before adding
     let filesToAdd = files.filter(
       (f) =>
         f.type === "file" &&
         (changedFiles.some((c) => c.path === f.path) ||
          !fileContext.some((item) => item.path === f.path))
     );
+    
+    // Filter by sambaAddFilter
+    if (sambaAddFilter.trim()) {
+      const filterLower = sambaAddFilter.trim().toLowerCase();
+      filesToAdd = filesToAdd.filter((f) => 
+        f.path.toLowerCase().includes(filterLower) || (f.name && f.name.toLowerCase().includes(filterLower))
+      );
+    }
+    
     if (autoAddLimit > 0) {
       filesToAdd = filesToAdd.slice(0, autoAddLimit);
     }
     if (filesToAdd.length === 0) {
-      setStatus("Všechny soubory jsou již v kontextu a aktuální.");
+      setStatus("Všechny soubory jsou již v kontextu a aktuální nebo neodpovídají filtru.");
       return;
     }
     const newCount = filesToAdd.length - changedFiles.length;
@@ -2201,13 +2353,22 @@ export default function Home() {
     ].filter(Boolean).join(" + ");
     setStatus(`Extrahuji ${filesToAdd.length} souborů (${label})...`);
     setLoadProgress({ label: "Start", percent: 0 });
+    
+    const controller = new AbortController();
+    addFilesAbortRef.current = controller;
+    
     let added = 0;
     let failed = 0;
+    let cancelled = false;
     let firstError: string | null = null;
     for (let index = 0; index < filesToAdd.length; index += 1) {
+      if (controller.signal.aborted) {
+        cancelled = true;
+        break;
+      }
+      
       const file = filesToAdd[index];
       try {
-        const controller = new AbortController();
         const timeoutId = setTimeout(
           () => controller.abort(),
           REQUEST_TIMEOUT_MS * 2
@@ -2263,8 +2424,11 @@ export default function Home() {
             firstError = data.error;
           }
         }
-      } catch {
-        // ignore individual file errors
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          cancelled = true;
+          break;
+        }
         failed++;
       }
       const percent = Math.round(((index + 1) / filesToAdd.length) * 100);
@@ -2274,46 +2438,22 @@ export default function Home() {
       });
     }
     setLoadProgress(null);
-    if (added === 0 && failed > 0) {
-      setStatus(
-        firstError
-          ? `Nepodařilo se přidat žádný soubor. ${firstError}`
-          : "Nepodařilo se přidat žádný soubor. Zkontrolujte přístup k Samba cestě."
-      );
-      return;
+    addFilesAbortRef.current = null;
+    
+    if (cancelled) {
+      setStatus(`Přidávání přerušeno. Přidáno ${added} souborů.`);
+    } else {
+      if (added === 0 && failed > 0) {
+        setStatus(
+          firstError
+            ? `Nepodařilo se přidat žádný soubor. ${firstError}`
+            : "Nepodařilo se přidat žádný soubor. Zkontrolujte přístup k Samba cestě."
+        );
+        return;
+      }
+      const updatedSuffix = changedCount > 0 ? ` (${changedCount} aktualizováno)` : "";
+      setStatus(`✓ Přidáno ${added} souborů do kontextu${updatedSuffix}. Neúspěšné: ${failed}`);
     }
-    const updatedSuffix = changedCount > 0 ? ` (${changedCount} aktualizováno)` : "";
-    setStatus(`✓ Přidáno ${added} souborů do kontextu${updatedSuffix}. Neúspěšné: ${failed}`);
-  };
-
-  /** Apply name filter + days filter to samba file list */
-  const filterSambaFiles = (allFiles: SambaEntry[]): SambaEntry[] => {
-    let result = allFiles;
-    // Name filter
-    const hasNameFilter = sambaFilter.trim().length > 0;
-    if (hasNameFilter) {
-      const parsed = parseSearchTerms(sambaFilter);
-      const isWild = parsed.include.length === 1 && parsed.include[0] === "*";
-      result = result.filter((f) => {
-        const text = normalizeCzech(`${String(f.path)} ${String(f.name ?? "")}`);
-        if (!isWild && parsed.include.length > 0) {
-          if (!parsed.include.every((t) => fuzzyContains(text, t))) return false;
-        }
-        if (parsed.exclude.length > 0) {
-          if (parsed.exclude.some((t) => fuzzyContains(text, t))) return false;
-        }
-        return true;
-      });
-    }
-    // Days filter
-    if (sambaMaxDays > 0) {
-      const cutoff = Date.now() - sambaMaxDays * 86_400_000;
-      result = result.filter((f) => {
-        const ts = f.modified ? new Date(f.modified).getTime() : 0;
-        return ts >= cutoff;
-      });
-    }
-    return result;
   };
 
   const handleAddAllSambaToContext = async () => {
@@ -2843,6 +2983,7 @@ export default function Home() {
         };
       });
       const controller = new AbortController();
+      indexAbortRef.current = controller;
       const timeoutId = setTimeout(
         () => controller.abort(),
         REQUEST_TIMEOUT_MS * 2
@@ -2858,6 +2999,7 @@ export default function Home() {
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
+      indexAbortRef.current = null;
       const data = (await response.json()) as {
         success?: boolean;
         message?: string;
@@ -2914,9 +3056,14 @@ export default function Home() {
         }
       }
     } catch (error) {
-      setStatus(
-        error instanceof Error ? error.message : "Indexing failed."
-      );
+      // Check if it's an abort error
+      if (error instanceof Error && error.name === "AbortError") {
+        setStatus("Indexace přerušena uživatelem.");
+      } else {
+        setStatus(
+          error instanceof Error ? error.message : "Indexing failed."
+        );
+      }
     } finally {
       setIsIndexing(false);
       setTimeout(() => setIndexProgress(null), 800);
@@ -3327,6 +3474,43 @@ export default function Home() {
         return;
       }
 
+      // Přímá otázka na počet souborů v kontextu (lokální odpověď, respektuje filtr)
+      const isContextFileCountQuestion =
+        /\bkolik\b/i.test(trimmed) &&
+        /soubor/i.test(trimmed) &&
+        /kontext/i.test(trimmed);
+
+      if (isContextFileCountQuestion) {
+        const totalFiles = fileContext.length;
+        const filteredFiles = filteredContext.length;
+        const hasFilter = contextFilter.trim().length > 0;
+        const effectiveFiltered = hasFilter && filteredFiles !== totalFiles;
+        const filesForStats = effectiveFiltered ? filteredContext : fileContext;
+        const totalLines = filesForStats.reduce((sum, f) => sum + (f.lineCount || 0), 0);
+        const totalSize = filesForStats.reduce((sum, f) => sum + (f.size || 0), 0);
+        const formatSize = (bytes: number) => {
+          if (bytes < 1024) return `${bytes} B`;
+          if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+          if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+          return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+        };
+
+        const response = totalFiles === 0
+          ? "V kontextu nemáte žádné soubory."
+          : effectiveFiltered
+            ? `V kontextu máte celkem ${totalFiles} souborů. Pro práci jsou připraveny ${filteredFiles} soubory (filtrováno podle cesty), celkem asi ${totalLines.toLocaleString('cs-CZ')} řádků a ${formatSize(totalSize)}.`
+            : `V kontextu máte ${totalFiles} souborů, celkem asi ${totalLines.toLocaleString('cs-CZ')} řádků a ${formatSize(totalSize)}.`;
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text: response,
+          },
+        ]);
+        return;
+      }
+
       // Otázky o metadatech/stavu systému (před počítáním výskytů v souborech)
       const asksAboutSystemStatus =
         /(kolik\s*(je|m[aá]m|m[aá]me|obsahuje|načten[ýo]|v|zaindexovan[ýo])\s*(soubor[ůy]|chunk[ůy]|dokument[ůy]|text[ůy])(\s*(v|v\s*)?(kontext|databáz|knowledge|kb))?)|(počet\s*(soubor[ůy]|chunk[ůy]|dokument[ůy]))|(jak\s*(velk[áý]|velk[éý])\s*(je\s*)?(databáze|db|knowledge\s*base|kontext))|(co\s*je\s*v\s*knowledge\s*base)/i.test(
@@ -3506,8 +3690,10 @@ export default function Home() {
       
       // Build body with filtering info
       const filteredContextToUse = filteredContext.length > 0 ? buildContext(filteredContext) : buildContext(fileContext);
+      const filesToUse = filteredContext.length > 0 ? filteredContext : fileContext;
       const totalFilesCount = fileContext.length;
-      const filteredFilesCount = filteredContext.length > 0 ? filteredContext.length : fileContext.length;
+      const filteredFilesCount = filesToUse.length;
+      const totalLinesCount = filesToUse.reduce((sum, f) => sum + (f.lineCount || 0), 0);
       const contextSizeBytes = filteredContextToUse.length;
       
       const body =
@@ -3521,7 +3707,8 @@ export default function Home() {
               context: filteredContextToUse,
               totalFiles: totalFilesCount,
               filteredFiles: filteredFilesCount,
-              contextSize: contextSizeBytes
+              contextSize: contextSizeBytes,
+              totalLines: totalLinesCount
             });
 
       let response: Response;
@@ -3803,8 +3990,8 @@ export default function Home() {
               </button>
               <button
                 className="rounded-2xl border border-slate-600 bg-slate-900/40 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900/60 transition"
-                onClick={() => applySecretWordToSambaForm(secretWord)}
-                title="Předvyplní formulář Samba (bez spuštění skenu)"
+                onClick={() => applySecretWordToSambaForm(secretWord).catch((err) => setStatus(err instanceof Error ? err.message : "Failed"))}
+                title="Načte soubory z Samby a automaticky je přidá do kontextu"
               >
                 Samba
               </button>
@@ -4254,7 +4441,167 @@ export default function Home() {
             </div>
           )}
 
-          <div className="grid gap-4 md:grid-cols-[1fr_auto]">
+          <div className="grid gap-4 md:grid-cols-[3fr_1fr]">
+            {/* Levá strana 75% - Kontext, Výsledky, Síťové soubory */}
+            <div className="flex flex-col gap-4">
+              
+              {/* KONTEXT TABULKA */}
+              <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+                <h3 className="text-sm font-semibold text-slate-200">
+                  Kontext ({fileContext.length})
+                </h3>
+                <p className="mt-1 text-xs text-slate-400">
+                  {contextText.length} / {MAX_CONTEXT_CHARS} chars
+                </p>
+                {fileContext.length > 0 && (() => {
+                  const totalLines = fileContext.reduce((sum, f) => sum + (f.lineCount || 0), 0);
+                  const totalSize = fileContext.reduce((sum, f) => sum + (f.size || 0), 0);
+                  const formatSize = (bytes: number) => {
+                    if (bytes < 1024) return `${bytes} B`;
+                    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+                    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+                    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+                  };
+                  return (
+                    <div className="mt-2 bg-slate-900/50 rounded-lg p-2 border border-slate-800">
+                      <div className="text-[11px] text-slate-400 grid grid-cols-3 gap-2">
+                        <div><span className="text-slate-500">Řádky:</span> <span className="text-emerald-400 font-semibold">{totalLines.toLocaleString('cs-CZ')}</span></div>
+                        <div><span className="text-slate-500">Velikost:</span> <span className="text-emerald-400 font-semibold">{formatSize(totalSize)}</span></div>
+                        <div><span className="text-slate-500">Průměr:</span> <span className="text-blue-400 font-semibold">{Math.round(totalSize / Math.max(fileContext.length, 1) / 1024)} KB</span></div>
+                      </div>
+                    </div>
+                  );
+                })()}
+                <div className="mt-3">
+                  <input
+                    className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500"
+                    placeholder="Filtrovat kontext podle cesty (např. export-2019-10)"
+                    value={contextFilter}
+                    onChange={(e) => setContextFilter(e.target.value)}
+                  />
+                  {filteredContext.length !== fileContext.length && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Filtrováno: {filteredContext.length} / {fileContext.length}
+                    </p>
+                  )}
+                </div>
+                <div className="mt-3 max-h-96 overflow-auto text-xs">
+                  {fileContext.length === 0 && (
+                    <p className="text-slate-500 p-4">Žádné soubory v kontextu.</p>
+                  )}
+                  {displayedContext.length > 0 && (
+                    <table className="w-full border-collapse">
+                      <thead className="sticky top-0 bg-slate-950 border-b border-slate-700">
+                        <tr>
+                          <th 
+                            className="text-left py-2 px-3 text-slate-400 font-medium cursor-pointer hover:text-slate-200 transition"
+                            onClick={() => {
+                              if (contextSortBy === "name") {
+                                setContextSortDesc(!contextSortDesc);
+                              } else {
+                                setContextSortBy("name");
+                                setContextSortDesc(false);
+                              }
+                            }}
+                            title="Klikni pro třídění"
+                          >
+                            Název souboru {contextSortBy === "name" && (contextSortDesc ? "↓" : "↑")}
+                          </th>
+                          <th 
+                            className="text-right py-2 px-3 text-slate-400 font-medium w-16 cursor-pointer hover:text-slate-200 transition"
+                            onClick={() => {
+                              if (contextSortBy === "lines") {
+                                setContextSortDesc(!contextSortDesc);
+                              } else {
+                                setContextSortBy("lines");
+                                setContextSortDesc(false);
+                              }
+                            }}
+                            title="Klikni pro třídění"
+                          >
+                            Řádky {contextSortBy === "lines" && (contextSortDesc ? "↓" : "↑")}
+                          </th>
+                          <th 
+                            className="text-right py-2 px-3 text-slate-400 font-medium w-20 cursor-pointer hover:text-slate-200 transition"
+                            onClick={() => {
+                              if (contextSortBy === "size") {
+                                setContextSortDesc(!contextSortDesc);
+                              } else {
+                                setContextSortBy("size");
+                                setContextSortDesc(false);
+                              }
+                            }}
+                            title="Klikni pro třídění"
+                          >
+                            Velikost {contextSortBy === "size" && (contextSortDesc ? "↓" : "↑")}
+                          </th>
+                          <th 
+                            className="text-right py-2 px-3 text-slate-400 font-medium w-32 cursor-pointer hover:text-slate-200 transition"
+                            onClick={() => {
+                              if (contextSortBy === "modified") {
+                                setContextSortDesc(!contextSortDesc);
+                              } else {
+                                setContextSortBy("modified");
+                                setContextSortDesc(false);
+                              }
+                            }}
+                            title="Klikni pro třídění"
+                          >
+                            Změna {contextSortBy === "modified" && (contextSortDesc ? "↓" : "↑")}
+                          </th>
+                          <th className="text-right py-2 px-3 text-slate-400 font-medium w-12"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {displayedContext.map((item) => (
+                          <tr key={item.path} className="border-b border-slate-800 hover:bg-slate-900/60 transition">
+                            <td className="py-2 px-3">
+                              <span className="text-slate-200 truncate block" title={item.path}>
+                                {item.path.split('/').pop() || item.path}
+                              </span>
+                              <span className="text-[10px] text-slate-600 block">{item.path}</span>
+                            </td>
+                            <td className="text-right py-2 px-3 text-slate-300 font-mono">
+                              {item.lineCount?.toLocaleString('cs-CZ') || '-'}
+                            </td>
+                            <td className="text-right py-2 px-3 text-slate-300 font-mono">
+                              {((item.size || 0) / 1024).toFixed(1)} KB
+                            </td>
+                            <td className="text-right py-2 px-3 text-slate-400 text-[11px]">
+                              {item.modified ? new Date(item.modified).toLocaleString('cs-CZ', { 
+                                year: 'numeric', 
+                                month: '2-digit', 
+                                day: '2-digit',
+                                hour: '2-digit',
+                                minute: '2-digit'
+                              }) : '-'}
+                            </td>
+                            <td className="text-right py-2 px-3">
+                              <button
+                                className="text-rose-400 hover:text-rose-300 transition text-xs"
+                                onClick={() => handleRemoveContext(item.path)}
+                                title="Odebrat"
+                              >
+                                ✕
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  {fileContext.length > contextDisplayCount && (
+                    <button
+                      className="mt-2 w-full text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                      onClick={() => setContextDisplayCount(contextDisplayCount + 100)}
+                    >
+                      Load More ({displayedContext.length}/{fileContext.length})
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* VÝSLEDKY */}
             <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-semibold text-slate-200">
@@ -4271,6 +4618,7 @@ export default function Home() {
               </div>
               <div className="mt-3 max-h-72 space-y-2 overflow-auto text-sm">
                 {results.length === 0 && (
+
                   <p className="text-slate-500">Žádné výsledky.</p>
                 )}
                 {results.map((entry) => (
@@ -4317,7 +4665,19 @@ export default function Home() {
                         Zrušit filtry
                       </button>
                     )}
-                    {sambaFiles.filter((f) => f.type === "file").length > 0 && (
+                    {loadProgress && (
+                      <button
+                        className="text-xs px-2 py-1 rounded bg-rose-900 hover:bg-rose-800 text-rose-200 transition"
+                        onClick={() => {
+                          if (addFilesAbortRef.current) {
+                            addFilesAbortRef.current.abort();
+                          }
+                        }}
+                      >
+                        ⏹ Stop
+                      </button>
+                    )}
+                    {sambaFiles.filter((f) => f.type === "file").length > 0 && !loadProgress && (
                       <button
                         className="text-xs px-2 py-1 rounded bg-emerald-900 hover:bg-emerald-800 text-emerald-200"
                         onClick={handleAddAllSambaToContext}
@@ -4327,6 +4687,40 @@ export default function Home() {
                     )}
                   </div>
                 </div>
+                {/* Filter for adding */}
+                {sambaFiles.filter((f) => f.type === "file").length > 0 && (
+                  <div className="mt-2 p-2 bg-slate-900/40 rounded-lg border border-slate-800">
+                    <input
+                      className="w-full text-xs rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-slate-200 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none"
+                      placeholder="Filtr pro Add (např. .xlsx, 2019)"
+                      value={sambaAddFilter}
+                      onChange={(e) => setSambaAddFilter(e.target.value)}
+                    />
+                    {sambaAddFilter && (
+                      <p className="mt-1 text-[10px] text-slate-500">
+                        Filtr: přidá jen soubory obsahující "{sambaAddFilter}"
+                      </p>
+                    )}
+                  </div>
+                )}
+                
+                {/* Filter input for display */}
+                {sambaFiles.filter((f) => f.type === "file").length > 0 && (
+                  <div className="mt-2 p-2 bg-slate-900/40 rounded-lg border border-slate-800">
+                    <input
+                      className="w-full text-xs rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-slate-200 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none"
+                      placeholder="Filtr zobrazení (např. .xlsx, 2019)"
+                      value={sambaFilter}
+                      onChange={(e) => setSambaFilter(e.target.value)}
+                    />
+                    {sambaFilter && (
+                      <p className="mt-1 text-[10px] text-slate-500">
+                        Zobrazuje soubory obsahující "{sambaFilter}"
+                      </p>
+                    )}
+                  </div>
+                )}
+                
                 {(() => {
                   const allFiles = sambaFiles.filter((f) => f.type === "file");
                   const hasContentFilterSamba = sambaContentFilter.trim().length > 0;
@@ -4349,46 +4743,99 @@ export default function Home() {
                           )}
                         </p>
                       )}
-                      <div className="mt-3 max-h-72 space-y-2 overflow-auto text-sm">
+                      <div className="mt-3 max-h-96 overflow-auto text-xs">
                         {filtered.length === 0 && allFiles.length > 0 && (
                           <p className="text-xs text-slate-500">Žádné soubory neodpovídají filtru.</p>
                         )}
                         {filtered.length === 0 && allFiles.length === 0 && (
                           <p className="text-xs text-slate-500">Klikněte "Prohledat úložiště" pro načtení souborů.</p>
                         )}
-                        {filtered
-                          .slice(0, 200)
-                          .map((file) => (
-                            <button
-                              key={file.path}
-                              className="w-full text-left flex items-start justify-between gap-2 rounded-xl border border-slate-800 bg-slate-900/40 px-3 py-2 hover:bg-slate-900/60 transition"
-                              onClick={() => handleAddSambaToContext(file.path)}
-                            >
-                              <div>
-                                <p className="font-medium text-slate-100">
-                                  {file.name}
-                                </p>
-                                <p className="text-xs text-slate-400">
-                                  {(file.size / 1024).toFixed(1)} KB
-                                  {file.modified && (
-                                    <span>
-                                      {" \u2022 "}{new Date(file.modified).toLocaleString()}
+                        {displayedSambaFiles.length > 0 && (
+                          <table className="w-full border-collapse">
+                            <thead className="sticky top-0 bg-slate-950 border-b border-slate-700">
+                              <tr>
+                                <th 
+                                  className="text-left py-2 px-3 text-slate-400 font-medium cursor-pointer hover:text-slate-200 transition"
+                                  onClick={() => {
+                                    if (sambaSortBy === "name") {
+                                      setSambaSortDesc(!sambaSortDesc);
+                                    } else {
+                                      setSambaSortBy("name");
+                                      setSambaSortDesc(false);
+                                    }
+                                  }}
+                                  title="Klikni pro třídění"
+                                >
+                                  Název souboru {sambaSortBy === "name" && (sambaSortDesc ? "↓" : "↑")}
+                                </th>
+                                <th 
+                                  className="text-right py-2 px-3 text-slate-400 font-medium w-20 cursor-pointer hover:text-slate-200 transition"
+                                  onClick={() => {
+                                    if (sambaSortBy === "size") {
+                                      setSambaSortDesc(!sambaSortDesc);
+                                    } else {
+                                      setSambaSortBy("size");
+                                      setSambaSortDesc(false);
+                                    }
+                                  }}
+                                  title="Klikni pro třídění"
+                                >
+                                  Velikost {sambaSortBy === "size" && (sambaSortDesc ? "↓" : "↑")}
+                                </th>
+                                <th 
+                                  className="text-right py-2 px-3 text-slate-400 font-medium w-32 cursor-pointer hover:text-slate-200 transition"
+                                  onClick={() => {
+                                    if (sambaSortBy === "modified") {
+                                      setSambaSortDesc(!sambaSortDesc);
+                                    } else {
+                                      setSambaSortBy("modified");
+                                      setSambaSortDesc(false);
+                                    }
+                                  }}
+                                  title="Klikni pro třídění"
+                                >
+                                  Změna {sambaSortBy === "modified" && (sambaSortDesc ? "↓" : "↑")}
+                                </th>
+                                <th className="text-right py-2 px-3 text-slate-400 font-medium w-12"></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {displayedSambaFiles.map((file) => (
+                                <tr key={file.path} className="border-b border-slate-800 hover:bg-slate-900/60 transition">
+                                  <td className="py-2 px-3">
+                                    <span className="text-slate-200 truncate block" title={file.path}>
+                                      {file.name}
                                     </span>
-                                  )}
-                                  {file.created && (
-                                    <span>
-                                      {" \u2022 vytvo\u0159eno "}{new Date(
-                                        file.created
-                                      ).toLocaleString()}
-                                    </span>
-                                  )}
-                                </p>
-                              </div>
-                              <span className="text-xs text-emerald-400">+ Add</span>
-                            </button>
-                          ))}
+                                    <span className="text-[10px] text-slate-600 block">{file.path}</span>
+                                  </td>
+                                  <td className="text-right py-2 px-3 text-slate-300 font-mono">
+                                    {((file.size || 0) / 1024).toFixed(1)} KB
+                                  </td>
+                                  <td className="text-right py-2 px-3 text-slate-400 text-[11px]">
+                                    {file.modified ? new Date(file.modified).toLocaleString('cs-CZ', { 
+                                      year: 'numeric', 
+                                      month: '2-digit', 
+                                      day: '2-digit',
+                                      hour: '2-digit',
+                                      minute: '2-digit'
+                                    }) : '-'}
+                                  </td>
+                                  <td className="text-right py-2 px-3">
+                                    <button
+                                      className="text-emerald-400 hover:text-emerald-300 transition text-xs"
+                                      onClick={() => handleAddSambaToContext(file.path)}
+                                      title="Přidat do kontextu"
+                                    >
+                                      + Add
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
                         {filtered.length > 200 && (
-                          <p className="text-xs text-slate-500">
+                          <p className="text-xs text-slate-500 mt-2">
                             {"... zobrazeno prvn\u00edch 200 z "}{filtered.length}
                           </p>
                         )}
@@ -4399,6 +4846,9 @@ export default function Home() {
               </div>
             )}
 
+            </div>
+
+            {/* Pravá strana 25% - Tlačítka */}
             <div className="flex flex-col gap-3">
               <button
                 className="rounded-2xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-900"
@@ -4407,21 +4857,35 @@ export default function Home() {
               >
                 Přidat vybrané soubory do kontextu
               </button>
-              <button
-                className={`rounded-2xl px-4 py-2 text-sm font-semibold ${
-                  isIndexed
-                    ? "bg-blue-500 text-white"
-                    : "bg-amber-500 text-slate-900"
-                } disabled:opacity-60`}
-                onClick={handleIndexFiles}
-                disabled={fileContext.length === 0 || isIndexing || isRebuilding}
-              >
-                {isIndexing
-                  ? "Indexování..."
-                  : isIndexed
-                    ? "✓ Indexováno"
-                    : "Indexovat soubory do databáze "}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  className={`rounded-2xl px-4 py-2 text-sm font-semibold ${
+                    isIndexed
+                      ? "bg-blue-500 text-white"
+                      : "bg-amber-500 text-slate-900"
+                  } disabled:opacity-60`}
+                  onClick={handleIndexFiles}
+                  disabled={fileContext.length === 0 || isIndexing || isRebuilding}
+                >
+                  {isIndexing
+                    ? "Indexování..."
+                    : isIndexed
+                      ? "✓ Indexováno"
+                      : "Indexovat soubory do databáze "}
+                </button>
+                {isIndexing && (
+                  <button
+                    className="rounded-2xl border border-rose-500/60 px-4 py-2 text-sm font-semibold text-rose-200 hover:bg-rose-500/10 transition"
+                    onClick={() => {
+                      if (indexAbortRef.current) {
+                        indexAbortRef.current.abort();
+                      }
+                    }}
+                  >
+                    ⏹ Stop
+                  </button>
+                )}
+              </div>
               <button
                 className="rounded-2xl border border-amber-500/60 px-4 py-2 text-sm font-semibold text-amber-200 hover:bg-amber-500/10 disabled:opacity-60"
                 onClick={() => handleRebuildIndex("truncate")}
@@ -4448,74 +4912,6 @@ export default function Home() {
               >
                 Vymazat kontext
               </button>
-
-              <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
-                <h3 className="text-sm font-semibold text-slate-200">
-                  Kontext ({fileContext.length})
-                </h3>
-                <p className="mt-1 text-xs text-slate-400">
-                  {contextText.length} / {MAX_CONTEXT_CHARS} chars
-                </p>
-                {fileContext.length > 0 && (() => {
-                  const totalLines = fileContext.reduce((sum, f) => sum + (f.lineCount || 0), 0);
-                  const totalSize = fileContext.reduce((sum, f) => sum + (f.size || 0), 0);
-                  const formatSize = (bytes: number) => {
-                    if (bytes < 1024) return `${bytes} B`;
-                    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-                    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-                    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-                  };
-                  return (
-                    <div className="mt-2 bg-slate-900/50 rounded-lg p-2 border border-slate-800">
-                      <div className="text-[11px] text-slate-400 grid grid-cols-3 gap-2">
-                        <div><span className="text-slate-500">Řádky:</span> <span className="text-emerald-400 font-semibold">{totalLines.toLocaleString('cs-CZ')}</span></div>
-                        <div><span className="text-slate-500">Velikost:</span> <span className="text-emerald-400 font-semibold">{formatSize(totalSize)}</span></div>
-                        <div><span className="text-slate-500">Průměr:</span> <span className="text-blue-400 font-semibold">{Math.round(totalSize / Math.max(fileContext.length, 1) / 1024)} KB</span></div>
-                      </div>
-                    </div>
-                  );
-                })()}
-                <div className="mt-3">
-                  <input
-                    className="w-full rounded-2xl border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500"
-                    placeholder="Filtrovat kontext podle cesty (např. export-2019-10)"
-                    value={contextFilter}
-                    onChange={(e) => setContextFilter(e.target.value)}
-                  />
-                  {filteredContext.length !== fileContext.length && (
-                    <p className="mt-1 text-[11px] text-slate-500">
-                      Filtrováno: {filteredContext.length} / {fileContext.length}
-                    </p>
-                  )}
-                </div>
-                <div className="mt-3 max-h-56 space-y-2 overflow-auto text-xs">
-                  {fileContext.length === 0 && (
-                    <p className="text-slate-500">Žádné soubory v kontextu.</p>
-                  )}
-                  {displayedContext.map((item) => (
-                    <div
-                      key={item.path}
-                      className="flex items-center justify-between gap-2 rounded-xl border border-slate-800 bg-slate-900/40 px-3 py-2"
-                    >
-                      <div className="flex-1 min-w-0">
-                        <span className="text-slate-200 block truncate">{item.path}</span>
-                        <span className="text-[10px] text-slate-500">{item.lineCount} řádků • {(item.size / 1024).toFixed(1)} KB</span>
-                      </div>
-                      <button
-                        className="text-xs text-rose-300 whitespace-nowrap"
-                        onClick={() => handleRemoveContext(item.path)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  ))}
-                  {filteredContext.length > displayedContext.length && (
-                    <p className="text-slate-500">
-                      ... showing first {displayedContext.length} of {filteredContext.length}
-                    </p>
-                  )}
-                </div>
-              </div>
             </div>
           </div>
         </section>

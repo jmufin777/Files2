@@ -291,9 +291,11 @@ export async function POST(request: Request) {
     const contextCounts = (() => {
       let totalLines = 0;
       let totalSizeBytes = 0;
-      for (const doc of results) {
-        if (doc.metadata.line_count) totalLines += doc.metadata.line_count as number;
-        if (doc.metadata.file_size) totalSizeBytes += doc.metadata.file_size as number;
+      // Sum per unique source to avoid counting the same file multiple times.
+      for (const source of allSources) {
+        const meta = sourceMetadataMap.get(source);
+        if (meta?.lineCount) totalLines += meta.lineCount;
+        if (meta?.fileSize) totalSizeBytes += meta.fileSize;
       }
       return { files: allSources.length, totalLines, totalSizeBytes };
     })();
@@ -302,7 +304,7 @@ export async function POST(request: Request) {
 - Questions containing "kolik" (how many) + any form of "soubor" (file) + "kontext" (context)
 - This includes ALL grammatical variations: "souboru", "souborů", "soubory", "soubor"
 - Examples: "kolik je souboru", "kolik je souborů", "kolik je soubory", "kolik máme souboru", "kolik mame souboru", "kolik mám souboru", "počet souboru", "počet souborů"
-- When you detect such a question, ALWAYS respond with ONLY: "V kontextu máte ${contextCounts.files} souborů, celkem asi ${contextCounts.totalLines.toLocaleString()} řádků a ${(contextCounts.totalSizeBytes / (1024 * 1024)).toFixed(1)} MB." in Czech. Nothing else - just this answer.`;
+  - When you detect such a question, ALWAYS respond with ONLY: "V kontextu máte celkem ${contextCounts.files} souborů. Pro práci jsou připraveny ${contextCounts.files} soubory (výběr z indexu), celkem asi ${contextCounts.totalLines.toLocaleString()} řádků a ${(contextCounts.totalSizeBytes / (1024 * 1024)).toFixed(1)} MB." in Czech. Nothing else - just this answer.`;
 
     const contextInfo = results.length > maxChunks 
       ? `\n\nIMPORTANT: You are analyzing ${limitedResults.length} chunks out of ${results.length} total chunks from ${allSources.length} files. The analysis is based on a representative sample.`

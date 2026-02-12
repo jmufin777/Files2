@@ -10,6 +10,7 @@ type GeminiRequest = {
   totalFiles?: number;      // Total files available (before filtering)
   filteredFiles?: number;   // Files actually in context (after filtering)
   contextSize?: number;     // Size of context in bytes
+  totalLines?: number;      // Total lines across all files
 };
 
 // Rate limiting
@@ -178,20 +179,39 @@ export async function POST(request: Request) {
 3. Always return the chart block using EXACTLY this format at the end:\n[[CHART]]\n{"title":"<short title>","type":"pie|bar|line","labels":["A","B","C"],"series":[10,20,30]}\n[[/CHART]]\nSupport types: pie, bar, line. Only include the chart block if you can provide reliable or appropriately generated numbers. Keep the rest of the answer in Czech.`;
     
     // Count files and stats from context header if available
-    const contextCountMatch = payload.context?.match(/^Kontext \((\d+)\)\s*\n/m);
-    const fileCount = contextCountMatch ? parseInt(contextCountMatch[1], 10) : null;
-    const totalLinesMatch = payload.context?.match(/Řádky:\s*([\d\s,]+)/);
-    const totalSizeMatch = payload.context?.match(/Velikost:\s*([\d.,\sKMBG]+)/);
-    const totalLines = totalLinesMatch ? totalLinesMatch[1].trim() : null;
-    const totalSize = totalSizeMatch ? totalSizeMatch[1].trim() : null;
+    // buildContext() returns format: "# Context summary\ntotal_files=N\ntotal_size_bytes=X\n..."
+    // Use filteredFiles from payload - it's the actual count after filtering
+    const fileCount = payload.filteredFiles ?? null;
+    const totalFilesBeforeFilter = payload.totalFiles ?? fileCount;
+    const isFiltered = totalFilesBeforeFilter && fileCount && totalFilesBeforeFilter !== fileCount;
+    
+    // Use provided totalLines or fallback to payload totalLines
+    const totalLines = payload.totalLines?.toString() ?? null;
+    const totalSize = payload.contextSize 
+      ? `${(payload.contextSize / 1024).toFixed(1)} KB`
+      : null;
 
     const contextCountsInstruction = fileCount
-      ? `\n\nIMPORTANT: The user is working with a Context section that contains exactly ${fileCount} files${totalLines ? ` totaling approximately ${totalLines} lines` : ''}${totalSize ? ` and ${totalSize}` : ''}. 
-When the user asks a question in Czech about the NUMBER/COUNT of files in the context, you must recognize patterns like:
-- Questions containing "kolik" (how many) + any form of "soubor" (file)
-- This includes ALL grammatical variations: "souboru", "souborů", "soubory", "soubor"
-- Examples: "kolik je souboru", "kolik je souborů", "kolik je soubory", "kolik máme souboru", "kolik mame souboru", "kolik mám souboru", "počet souboru", "počet souborů"
-- When you detect such a question, ALWAYS respond with ONLY: "V kontextu máte ${fileCount} souborů${totalLines ? `, celkem asi ${totalLines} řádků` : ''}${totalSize ? ` a ${totalSize}` : ''}." in Czech. Nothing else - just this answer.`
+      ? `\n\n🚨 CRITICAL FILE COUNT INSTRUCTION 🚨
+The Context text below may contain "total_files=N" but IGNORE THAT VALUE.
+
+IMPORTANT DISTINCTION:
+${isFiltered 
+  ? `- Total files in full context: ${totalFilesBeforeFilter} files
+- Files VISIBLE and ready for analysis (filtered): ${fileCount} files
+- Only these ${fileCount} filtered files are shown in the Context below
+- Statistics below (lines, size) are ONLY for the ${fileCount} filtered files` 
+  : `- Total files in context: ${fileCount} files`}
+${totalLines ? `- Lines in ${isFiltered ? 'filtered' : 'all'} files: ${totalLines}` : ''}
+${totalSize ? `- Size of ${isFiltered ? 'filtered' : 'all'} files: ${totalSize}` : ''}
+
+When the user asks in Czech "kolik je/máme/mám souborů/souboru/soubory v kontextu" or ANY variation with "kolik" + "soubor*", you MUST respond EXACTLY:
+${isFiltered 
+  ? `"V kontextu máte celkem ${totalFilesBeforeFilter} souborů. Pro práci jsou připraveny ${fileCount} soubory (filtrováno podle cesty)${totalLines ? `, celkem asi ${totalLines} řádků` : ''}${totalSize ? ` a ${totalSize}` : ''}."`
+  : `"V kontextu máte ${fileCount} souborů${totalLines ? `, celkem asi ${totalLines} řádků` : ''}${totalSize ? ` a ${totalSize}` : ''}."`}
+
+When answering questions, work ONLY with the ${fileCount} file${fileCount !== 1 ? 's' : ''} shown in Context below.
+DO NOT use any value from "total_files=" in the Context section below. Use ONLY the numbers stated above.`
       : '';
     
     const wantsStructured = /(strukturov|structured|prehled|přehled)/i.test(
@@ -203,7 +223,7 @@ When the user asks a question in Czech about the NUMBER/COUNT of files in the co
     const accessInstruction = `\n\nYou have access ONLY to the provided Context text. Never say things like "Nemám přístup k obsahu souborů" or "nemohu spočítat" because you do have access to whatever text is provided. If the provided Context does not include the needed file contents, say in Czech that the provided context is missing the relevant file contents and ask the user to add the relevant files to context.`;
 
     const prompt = payload.context
-      ? `Context:\n${payload.context}\n\nUser:\n${payload.message}${chartInstruction}${contextCountsInstruction}${structuredInstruction}${accessInstruction}`
+      ? `${contextCountsInstruction}\n\nContext:\n${payload.context}\n\nUser:\n${payload.message}${chartInstruction}${structuredInstruction}${accessInstruction}`
       : `${payload.message}${chartInstruction}${structuredInstruction}${accessInstruction}`;
 
     const result = await model.generateContent(prompt);
