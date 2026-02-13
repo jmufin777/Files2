@@ -180,7 +180,6 @@ const SKIP_DIRS = new Set(["node_modules", ".git", ".next", "dist", "build"]);
 const DEFAULT_OCR_MAX_PAGES = 5;
 const OCR_BATCH_SIZE = 5;
 const CONTEXTS_STORAGE_KEY = "nai.savedContexts.v1";
-const FILTERS_STORAGE_KEY = "nai.filters.v1";
 
 const DEFAULT_SECRET_WORD_SETTINGS: SecretWordSettings = {
   sambaPath: "",
@@ -1202,11 +1201,15 @@ export default function Home() {
   const [contentQuery, setContentQuery] = useState("");
   const [results, setResults] = useState<FileEntry[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [selectedLocalFilePaths, setSelectedLocalFilePaths] = useState<Set<string>>(new Set());
+  const [selectLocalFilesAllChecked, setSelectLocalFilesAllChecked] = useState(false);
   const [fileContext, setFileContext] = useState<FileContext[]>([]);
   const [searchContent, setSearchContent] = useState(false);
   const [searchMode, setSearchMode] = useState<"and" | "or">("and"); // AND by default
   const [status, setStatus] = useState<string | null>(null);
   const [isSearching, setIsSearching] = useState(false);
+  const [isAddingToContext, setIsAddingToContext] = useState(false);
+  const [addContextMode, setAddContextMode] = useState<"results" | "local" | "samba" | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatHistory, setChatHistory] = useState<ChatHistoryItem[]>([]);
@@ -1298,6 +1301,14 @@ export default function Home() {
     DEFAULT_SECRET_WORD_SETTINGS
   );
   const [isDeletingSecretWord, setIsDeletingSecretWord] = useState(false);
+
+  const normalizedSecretWord = secretWord.trim();
+  const isSecretUnlocked = normalizedSecretWord.length >= 5;
+
+  const contextsForSecret = useMemo(() => {
+    if (!isSecretUnlocked) return [];
+    return savedContexts.filter((ctx) => ctx.secretKey === normalizedSecretWord);
+  }, [savedContexts, isSecretUnlocked, normalizedSecretWord]);
   const [dataWarning, setDataWarning] = useState<{
     visible: boolean;
     title?: string;
@@ -1856,47 +1867,11 @@ export default function Home() {
               }
         );
         setSavedContexts(parsed);
-        if (parsed.length > 0) {
-          setActiveContextId((prev) => prev ?? parsed[0].id);
-        }
-      }
-    } catch {
-      // ignore
-    }
-    // Load filter settings
-    try {
-      const raw = window.localStorage.getItem(FILTERS_STORAGE_KEY);
-      if (raw) {
-        const f = JSON.parse(raw) as Record<string, unknown>;
-        if (typeof f.sambaFilter === "string") setSambaFilter(f.sambaFilter);
-        if (typeof f.sambaContentFilter === "string") setSambaContentFilter(f.sambaContentFilter);
-        if (typeof f.sambaMaxDays === "number") setSambaMaxDays(f.sambaMaxDays);
-        if (typeof f.folderMaxDays === "number") setFolderMaxDays(f.folderMaxDays);
-        if (typeof f.autoAddLimit === "number") setAutoAddLimit(f.autoAddLimit);
       }
     } catch {
       // ignore
     }
   }, []);
-
-  // Persist filter settings to localStorage
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      window.localStorage.setItem(
-        FILTERS_STORAGE_KEY,
-        JSON.stringify({
-          sambaFilter,
-          sambaContentFilter,
-          sambaMaxDays,
-          folderMaxDays,
-          autoAddLimit,
-        })
-      );
-    } catch {
-      // ignore
-    }
-  }, [sambaFilter, sambaContentFilter, sambaMaxDays, folderMaxDays, autoAddLimit]);
 
 
 
@@ -1924,12 +1899,33 @@ export default function Home() {
     }
   }, [savedContexts]);
 
+  useEffect(() => {
+    if (!isSecretUnlocked) {
+      setActiveContextId(null);
+      return;
+    }
+    if (contextsForSecret.length === 0) {
+      setActiveContextId(null);
+      return;
+    }
+    setActiveContextId((prev) =>
+      prev && contextsForSecret.some((ctx) => ctx.id === prev)
+        ? prev
+        : contextsForSecret[0].id
+    );
+  }, [isSecretUnlocked, contextsForSecret]);
+
   const activeContext = useMemo(() => {
-    if (!activeContextId) return null;
-    return savedContexts.find((ctx) => ctx.id === activeContextId) ?? null;
-  }, [activeContextId, savedContexts]);
+    if (!isSecretUnlocked || !activeContextId) return null;
+    return (
+      savedContexts.find(
+        (ctx) => ctx.id === activeContextId && ctx.secretKey === normalizedSecretWord
+      ) ?? null
+    );
+  }, [activeContextId, isSecretUnlocked, normalizedSecretWord, savedContexts]);
 
   const hasDbIndex = useMemo(() => {
+    if (!isSecretUnlocked) return false;
     return (
       isIndexed ||
       Boolean(activeContext?.lastIndexedAt) ||
@@ -1938,6 +1934,7 @@ export default function Home() {
       Boolean(knowledgeBase?.initialized)
     );
   }, [
+    isSecretUnlocked,
     isIndexed,
     activeContext?.lastIndexedAt,
     dbIndexStatus.hasAnyIndex,
@@ -1947,6 +1944,10 @@ export default function Home() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!isSecretUnlocked) {
+      setDbIndexStatus({ checked: true, hasAnyIndex: false, hasContextIndex: false });
+      return;
+    }
     let cancelled = false;
 
     const run = async () => {
@@ -1975,13 +1976,14 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [activeContext?.id]);
+  }, [activeContext?.id, isSecretUnlocked]);
 
   // Auto-load Samba file list when switching to a saved context with existing index
   const autoLoadedContextRef = useRef<string | null>(null);
   
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!isSecretUnlocked) return;
     if (!activeContext?.sambaPath) return;
     if (!dbIndexStatus.checked) return;
     
@@ -2069,11 +2071,23 @@ export default function Home() {
     };
     // Only react to context ID change (not status flags which change too often)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeContext?.id]);
+  }, [activeContext?.id, isSecretUnlocked]);
+
+  useEffect(() => {
+    if (isSecretUnlocked) return;
+    autoLoadedContextRef.current = null;
+    setSambaPath("");
+    setSambaFiles([]);
+    setSambaStats(null);
+    setSambaSuggestedPaths([]);
+    setKnowledgeBase(null);
+    setDbIndexStatus({ checked: true, hasAnyIndex: false, hasContextIndex: false });
+    setIsIndexed(false);
+  }, [isSecretUnlocked]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!secretWord || secretWord.length < 5) {
+    if (!isSecretUnlocked) {
       setKnowledgeBase(null);
       return;
     }
@@ -2082,7 +2096,7 @@ export default function Home() {
 
     const loadKB = async () => {
       try {
-        const prefix = `${secretWord}:`;
+        const prefix = `${normalizedSecretWord}:`;
         const res = await fetch(`/api/knowledge-base/status?prefix=${encodeURIComponent(prefix)}`);
         const data = (await res.json()) as {
           initialized: boolean;
@@ -2111,7 +2125,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [secretWord]);
+  }, [isSecretUnlocked, normalizedSecretWord]);
 
   const chartData = useMemo(() => {
     const sourcePaths: string[] = [];
@@ -2225,7 +2239,7 @@ export default function Home() {
     const hasContentFilter = contentParsed.include.length > 0 || contentParsed.exclude.length > 0;
 
     if (files.length === 0) {
-      if (sambaFiles.length > 0) {
+      if (isSecretUnlocked && sambaFiles.length > 0) {
         setSambaFilter(nameInput);
         setStatus("Filtroval jsem Samba soubory podle dotazu.");
       } else {
@@ -2390,6 +2404,10 @@ export default function Home() {
   };
 
   const handleSambaScan = async () => {
+    if (!isSecretUnlocked) {
+      setStatus("Samba je dostupná jen po zadání platného přístupového slova (min. 5 znaků).");
+      return;
+    }
     if (!sambaPath.trim()) {
       setStatus("Enter a Samba path (e.g., /mnt/samba or //server/share)");
       return;
@@ -2448,7 +2466,7 @@ export default function Home() {
         );
         
         // Save sambaPath to settings for current secret word
-        if (secretWord && secretWord.length >= 5) {
+        if (isSecretUnlocked) {
           setSecretWordSettings((prev) => ({
             ...prev,
             sambaPath: sambaPath.trim(),
@@ -2483,6 +2501,10 @@ export default function Home() {
   };
 
   const handleAddSambaToContext = async (filePath: string) => {
+    if (!isSecretUnlocked) {
+      setStatus("Přidání Samba souborů je dostupné jen po zadání přístupového slova.");
+      return;
+    }
     if (fileContext.some((item) => item.path === filePath)) {
       setStatus("Soubor již je v kontextu.");
       return;
@@ -2545,6 +2567,16 @@ export default function Home() {
   };
 
   const addSambaFilesToContext = async (files: SambaEntry[]) => {
+    if (!isSecretUnlocked) {
+      setStatus("Přidání Samba souborů je dostupné jen po zadání přístupového slova.");
+      return;
+    }
+    if (isAddingToContext) {
+      setStatus("Přidávání do kontextu už běží. Použijte Přerušit.");
+      return;
+    }
+    setIsAddingToContext(true);
+    setAddContextMode("samba");
     // Detect changed files (same path but different modified date) — re-extract them
     const changedFiles = files.filter((f) => {
       if (f.type !== "file") return false;
@@ -2581,6 +2613,8 @@ export default function Home() {
     }
     if (filesToAdd.length === 0) {
       setStatus("Všechny soubory jsou již v kontextu a aktuální nebo neodpovídají filtru.");
+      setIsAddingToContext(false);
+      setAddContextMode(null);
       return;
     }
     const newCount = filesToAdd.length - changedFiles.length;
@@ -2677,7 +2711,7 @@ export default function Home() {
     }
     setLoadProgress(null);
     addFilesAbortRef.current = null;
-    
+
     if (cancelled) {
       setStatus(`Přidávání přerušeno. Přidáno ${added} souborů.`);
     } else {
@@ -2687,11 +2721,13 @@ export default function Home() {
             ? `Nepodařilo se přidat žádný soubor. ${firstError}`
             : "Nepodařilo se přidat žádný soubor. Zkontrolujte přístup k Samba cestě."
         );
-        return;
+      } else {
+        const updatedSuffix = changedCount > 0 ? ` (${changedCount} aktualizováno)` : "";
+        setStatus(`✓ Přidáno ${added} souborů do kontextu${updatedSuffix}. Neúspěšné: ${failed}`);
       }
-      const updatedSuffix = changedCount > 0 ? ` (${changedCount} aktualizováno)` : "";
-      setStatus(`✓ Přidáno ${added} souborů do kontextu${updatedSuffix}. Neúspěšné: ${failed}`);
     }
+    setIsAddingToContext(false);
+    setAddContextMode(null);
   };
 
   const handleAddAllSambaToContext = async () => {
@@ -2700,20 +2736,39 @@ export default function Home() {
     await addSambaFilesToContext(filtered);
   };
 
+  const handleAbortAddToContext = () => {
+    if (addFilesAbortRef.current) {
+      addFilesAbortRef.current.abort();
+      setStatus("Přerušuju přidávání do kontextu...");
+    }
+  };
+
   const handleAddToContext = async () => {
+    if (isAddingToContext) {
+      setStatus("Přidávání do kontextu už běží. Použijte Přerušit.");
+      return;
+    }
     if (selectedPaths.size === 0) {
       setStatus("Vyberte alespoň jeden soubor z výsledků.");
       return;
     }
+    const controller = new AbortController();
+    addFilesAbortRef.current = controller;
+    setIsAddingToContext(true);
+    setAddContextMode("results");
     setStatus("Načítám vybrané soubory...");
     setLoadProgress({ label: "Start", percent: 0 });
     const selectedEntries = results.filter((entry) =>
       selectedPaths.has(entry.path)
     );
     const newContext: FileContext[] = [];
+    const existingPaths = new Set(fileContext.map((item) => item.path));
     for (let index = 0; index < selectedEntries.length; index += 1) {
+      if (controller.signal.aborted) {
+        break;
+      }
       const entry = selectedEntries[index];
-      if (fileContext.some((item) => item.path === entry.path)) {
+      if (existingPaths.has(entry.path)) {
         continue;
       }
       try {
@@ -2744,6 +2799,7 @@ export default function Home() {
           lineCount,
           modified: entry.modified,
         });
+        existingPaths.add(entry.path);
       } catch {
         setStatus(`Failed to read ${entry.path}.`);
       }
@@ -2756,7 +2812,94 @@ export default function Home() {
     setFileContext((prev) => [...prev, ...newContext]);
     setSelectedPaths(new Set());
     setLoadProgress(null);
-    setStatus(`Added ${newContext.length} files to context.`);
+    addFilesAbortRef.current = null;
+    setIsAddingToContext(false);
+    setAddContextMode(null);
+    if (controller.signal.aborted) {
+      setStatus(`Přidávání přerušeno. Přidáno ${newContext.length} souborů.`);
+    } else {
+      setStatus(`Added ${newContext.length} files to context.`);
+    }
+  };
+
+  const handleAddLocalFilesToContext = async () => {
+    if (isAddingToContext) {
+      setStatus("Přidávání do kontextu už běží. Použijte Přerušit.");
+      return;
+    }
+    if (selectedLocalFilePaths.size === 0) {
+      setStatus("Vyberte alespoň jeden soubor z tabulky.");
+      return;
+    }
+    const controller = new AbortController();
+    addFilesAbortRef.current = controller;
+    setIsAddingToContext(true);
+    setAddContextMode("local");
+    setStatus("Načítám vybrané soubory...");
+    setLoadProgress({ label: "Start", percent: 0 });
+    const selectedEntries = displayedFiles.filter((entry) =>
+      selectedLocalFilePaths.has(entry.path)
+    );
+    const newContext: FileContext[] = [];
+    const existingPaths = new Set(fileContext.map((item) => item.path));
+    for (let index = 0; index < selectedEntries.length; index += 1) {
+      if (controller.signal.aborted) {
+        break;
+      }
+      const entry = selectedEntries[index];
+      if (existingPaths.has(entry.path)) {
+        continue;
+      }
+      try {
+        const content = await readFileText(
+          entry,
+          MAX_FILE_BYTES,
+          ocrMaxPages,
+          (percent, label) => {
+            const fileProgress =
+              selectedEntries.length > 0
+                ? (index / selectedEntries.length) * 100
+                : 0;
+            const combined = Math.min(
+              99,
+              Math.round(fileProgress + percent / selectedEntries.length)
+            );
+            setLoadProgress({
+              label: `${entry.path} • ${label}`,
+              percent: combined,
+            });
+          }
+        );
+        const lineCount = content.split('\n').length - (content.endsWith('\n') ? 1 : 0);
+        newContext.push({
+          path: entry.path,
+          content,
+          size: entry.size,
+          lineCount,
+          modified: entry.modified,
+        });
+        existingPaths.add(entry.path);
+      } catch {
+        setStatus(`Failed to read ${entry.path}.`);
+      }
+      const overall = Math.round(((index + 1) / selectedEntries.length) * 100);
+      setLoadProgress({
+        label: `Hotovo ${index + 1}/${selectedEntries.length}`,
+        percent: overall,
+      });
+    }
+    setFileContext((prev) => [...prev, ...newContext]);
+    setSelectedLocalFilePaths(new Set());
+    setSelectLocalFilesAllChecked(false);
+    setLoadProgress(null);
+    addFilesAbortRef.current = null;
+    setIsAddingToContext(false);
+    setAddContextMode(null);
+    if (controller.signal.aborted) {
+      setStatus(`Přidávání přerušeno. Přidáno ${newContext.length} souborů.`);
+    } else {
+      setStatus(`Přidáno ${newContext.length} souborů do kontextu.`);
+    }
   };
 
   const handleCreateContext = () => {
@@ -3102,21 +3245,39 @@ export default function Home() {
 
   // Load settings for current secret word from localStorage
   useEffect(() => {
-    if (secretWord.length < 5 || typeof window === "undefined") {
+    if (!isSecretUnlocked || typeof window === "undefined") {
       setSecretWordSettings(DEFAULT_SECRET_WORD_SETTINGS);
+      setSambaPath("");
+      setSambaFilter("");
+      setSambaContentFilter("");
+      setSambaMaxDays(0);
+      setAutoAddSamba(false);
+      setAutoAddLimit(0);
       return;
     }
-    setSecretWordSettings(loadSecretWordSettings(secretWord));
-  }, [secretWord]);
+    const merged = loadSecretWordSettings(normalizedSecretWord);
+    setSecretWordSettings(merged);
+    setSambaPath(merged.sambaPath);
+    setSambaFilter(merged.sambaFilter);
+    setSambaContentFilter(merged.sambaContentFilter);
+    setSambaMaxDays(Math.max(0, merged.sambaMaxDays));
+    setAutoAddSamba(Boolean(merged.autoAddSamba));
+    setAutoAddLimit(Math.max(0, merged.autoAddLimit));
+    setQuery(merged.query);
+    setContentQuery(merged.contentQuery);
+    setFolderMaxDays(Math.max(0, merged.folderMaxDays));
+    setSearchMode(merged.searchMode);
+    setOcrMaxPages(merged.ocrMaxPages);
+  }, [isSecretUnlocked, normalizedSecretWord]);
 
   // Load chat history for current secret word from localStorage
   useEffect(() => {
-    if (typeof window === "undefined" || secretWord.length < 5) {
+    if (typeof window === "undefined" || !isSecretUnlocked) {
       setChatHistory([]);
       return;
     }
-    setChatHistory(loadChatHistoryForWord(secretWord));
-  }, [secretWord]);
+    setChatHistory(loadChatHistoryForWord(normalizedSecretWord));
+  }, [isSecretUnlocked, normalizedSecretWord]);
 
   const handleDeleteSecretWord = async () => {
     if (!secretWord || secretWord.length < 5) return;
@@ -3205,7 +3366,7 @@ export default function Home() {
   };
 
   const handleIndexFiles = async () => {
-    if (!secretWord || secretWord.length < 5) {
+    if (!isSecretUnlocked) {
       setStatus("Zadejte platné přístupové slovo (min. 5 znaků) pro indexaci.");
       return;
     }
@@ -3217,7 +3378,7 @@ export default function Home() {
     setStatus("Indexing files...");
     setIndexProgress({ label: "Příprava", percent: 0 });
     try {
-      const contextPrefix = secretWord ? `${secretWord}:` : "";
+      const contextPrefix = normalizedSecretWord ? `${normalizedSecretWord}:` : "";
       const filesPayload = fileContext.map((f, index) => {
         const percent = Math.round(((index + 1) / fileContext.length) * 50);
         setIndexProgress({
@@ -3280,12 +3441,12 @@ export default function Home() {
       const indexedAtIso = new Date().toISOString();
       const nextSaved = buildSettingsFromCurrentUi({ lastIndexedAt: indexedAtIso });
       setSecretWordSettings(nextSaved);
-      persistSecretWordSettings(secretWord, nextSaved);
+      persistSecretWordSettings(normalizedSecretWord, nextSaved);
       
       // Refresh Knowledge Base status
-      if (secretWord && secretWord.length >= 5) {
+      if (isSecretUnlocked) {
         try {
-          const prefix = `${secretWord}:`;
+          const prefix = `${normalizedSecretWord}:`;
           const kbRes = await fetch(`/api/knowledge-base/status?prefix=${encodeURIComponent(prefix)}`);
           const kbData = await kbRes.json();
           if (kbRes.ok) {
@@ -3318,6 +3479,10 @@ export default function Home() {
   };
 
   const handleRebuildIndex = async (mode: "drop" | "truncate") => {
+    if (!isSecretUnlocked) {
+      setStatus("Rebuild indexu je dostupný jen po zadání přístupového slova.");
+      return;
+    }
     if (isRebuilding) return;
     if (typeof window !== "undefined") {
       const promptMessage =
@@ -3366,6 +3531,82 @@ export default function Home() {
     let chatOk = true;
     let didTimeout = false;
     try {
+      const asksToDeduplicateContext =
+        /(duplicit|duplicate)/i.test(trimmed) &&
+        /(kontext|context)/i.test(trimmed) &&
+        /(vycist|vyčist|odstran|smaz|promaz|procist|pročist)/i.test(trimmed);
+
+      if (asksToDeduplicateContext) {
+        if (isAddingToContext) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text: "Právě běží přidávání do kontextu. Nejdřív ho přerušte a pak znovu spusťte čištění duplicit.",
+            },
+          ]);
+          return;
+        }
+        if (fileContext.length === 0) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text: "UI kontext je prázdný, není co deduplikovat.",
+            },
+          ]);
+          return;
+        }
+
+        const seen = new Set<string>();
+        const deduped: FileContext[] = [];
+        for (const file of fileContext) {
+          if (seen.has(file.path)) continue;
+          seen.add(file.path);
+          deduped.push(file);
+        }
+        const removed = fileContext.length - deduped.length;
+        setFileContext(deduped);
+        setStatus(`Deduplikace hotova: odstraněno ${removed} duplicit.`);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text:
+              removed > 0
+                ? `Hotovo. Odstranil jsem ${removed} duplicitních položek. V kontextu zůstává ${deduped.length} unikátních souborů.`
+                : `V kontextu jsem nenašel žádné duplicity. Zůstává ${deduped.length} souborů.`,
+          },
+        ]);
+        return;
+      }
+
+      const asksToClearContext =
+        /(kontext|context)/i.test(trimmed) &&
+        /(promaz|vymaz|smaz|vycist|vyčist|reset)/i.test(trimmed) &&
+        !/(duplicit|duplicate)/i.test(trimmed);
+
+      if (asksToClearContext) {
+        if (isAddingToContext) {
+          handleAbortAddToContext();
+        }
+        const removed = fileContext.length;
+        setFileContext([]);
+        setSelectedPaths(new Set());
+        setSelectedLocalFilePaths(new Set());
+        setSelectAllChecked(false);
+        setSelectLocalFilesAllChecked(false);
+        setStatus("UI kontext byl vymazán.");
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            text: `Hotovo. Smazal jsem UI kontext (${removed} souborů). Databázový index zůstává beze změny.`,
+          },
+        ]);
+        return;
+      }
+
       const asksWhatDataWeHave =
         /(s\s*jak(ymi|ými)\s*daty|jak(a|á)\s*data|co\s*m(a|á)me\s*k\s*dispozici|co\s*je\s*v\s*kontextu)/i.test(
           trimmed
@@ -3450,7 +3691,7 @@ export default function Home() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              secretWord: secretWord || undefined,
+              secretWord: normalizedSecretWord || undefined,
             }),
           });
           const data = (await response.json()) as {
@@ -3602,7 +3843,7 @@ export default function Home() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              secretWord: secretWord || undefined,
+              secretWord: normalizedSecretWord || undefined,
             }),
           });
           const data = (await response.json()) as {
@@ -3940,7 +4181,7 @@ export default function Home() {
       
       // Use indexed search ONLY if available AND no active UI filter
       // When filter is active, user explicitly wants to work with specific files
-      const useIndexedSearch = hasDbIndex && !hasActiveFilter;
+      const useIndexedSearch = isSecretUnlocked && hasDbIndex && !hasActiveFilter;
       const endpoint = useIndexedSearch ? "/api/search" : "/api/gemini";
       
       console.log(`[Chat] Endpoint: ${endpoint}, Reason: ${
@@ -3961,7 +4202,7 @@ export default function Home() {
         useIndexedSearch
           ? JSON.stringify({ 
               query: trimmed, 
-              secretWord: secretWord || undefined
+              secretWord: normalizedSecretWord || undefined
             })
           : JSON.stringify({ 
               message: trimmed, 
@@ -4463,9 +4704,18 @@ export default function Home() {
         <section className="grid gap-6 rounded-3xl border-2 border-blue-800 bg-slate-900/80 p-6">
           <div className="flex items-center justify-between border-b border-blue-700 pb-4 mb-2">
             <h2 className="text-xl font-bold text-blue-200">📁 Výběr souborů</h2>
-            {secretWord.length >= 5 && (
-              <p className="text-xs text-slate-400">Pro slovo: <span className="font-mono text-blue-300">{secretWord}</span></p>
+            {isSecretUnlocked && (
+              <p className="text-xs text-slate-400">Pro slovo: <span className="font-mono text-blue-300">{normalizedSecretWord}</span></p>
             )}
+          </div>
+          <div className={`rounded-2xl border px-3 py-2 text-xs ${
+            isSecretUnlocked
+              ? "border-emerald-700 bg-emerald-900/20 text-emerald-200"
+              : "border-amber-700 bg-amber-900/20 text-amber-200"
+          }`}>
+            {isSecretUnlocked
+              ? "🔐 Chráněný režim odemčen: Samba + index + Knowledge Base jsou aktivní pro zadané slovo."
+              : "📂 Lokální režim: dostupná je jen práce s vybranou složkou. Samba/KB/index se odemknou po zadání slova (min. 5 znaků)."}
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <button
@@ -4492,7 +4742,7 @@ export default function Home() {
             </div>
           </div>
 
-          {showSamba && (
+          {showSamba && isSecretUnlocked && (
           <div className="flex flex-col gap-3 rounded-2xl border border-slate-700 bg-slate-900/40 p-4">
             <h3 className="text-sm font-semibold text-slate-200">
               Nebo připojte Samba sdílení (pro dataset 300 GB+)
@@ -4698,13 +4948,31 @@ export default function Home() {
                 <h3 className="text-sm font-semibold text-slate-200">
                   Soubory ({displayedFiles.length})
                 </h3>
-                <button
-                  onClick={handleDownloadAllFiles}
-                  disabled={displayedFiles.length === 0}
-                  className="px-3 py-1 text-xs rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold disabled:opacity-50 transition"
-                >
-                  📥 Stáhnout vše
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleDownloadAllFiles}
+                    disabled={displayedFiles.length === 0}
+                    className="px-3 py-1 text-xs rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold disabled:opacity-50 transition"
+                  >
+                    📥 Stáhnout vše
+                  </button>
+                  {displayedFiles.length > 0 && (
+                    <button
+                      onClick={() => {
+                        if (selectLocalFilesAllChecked) {
+                          setSelectedLocalFilePaths(new Set());
+                          setSelectLocalFilesAllChecked(false);
+                        } else {
+                          setSelectedLocalFilePaths(new Set(displayedFiles.map((f) => f.path)));
+                          setSelectLocalFilesAllChecked(true);
+                        }
+                      }}
+                      className="px-2 py-1 text-xs rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 font-semibold transition"
+                    >
+                      {selectLocalFilesAllChecked ? "Zrušit výběr" : "Vybrat vše"}
+                    </button>
+                  )}
+                </div>
               </div>
               
               {/* Filtr */}
@@ -4723,11 +4991,8 @@ export default function Home() {
                   <table className="w-full border-collapse bg-white text-slate-900 text-xs">
                     <thead className="sticky top-0 bg-slate-100 border-b-2 border-slate-300">
                       <tr>
-                        <th 
-                          className="text-center py-2 px-2 text-slate-700 font-semibold w-8 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
-                          title="Index"
-                        >
-                          #
+                        <th className="text-center py-2 px-2 text-slate-700 font-semibold w-8 border border-slate-300">
+                          ✓
                         </th>
                         <th 
                           className="text-left py-2 px-3 text-slate-700 font-semibold border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
@@ -4743,19 +5008,6 @@ export default function Home() {
                           Soubor {fileSortBy === "name" && (fileSortDesc ? "↓" : "↑")}
                         </th>
                         <th 
-                          className="text-right py-2 px-3 text-slate-700 font-semibold w-20 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
-                          onClick={() => {
-                            if (fileSortBy === "lines") {
-                              setFileSortDesc(!fileSortDesc);
-                            } else {
-                              setFileSortBy("lines");
-                              setFileSortDesc(false);
-                            }
-                          }}
-                        >
-                          Řádky {fileSortBy === "lines" && (fileSortDesc ? "↓" : "↑")}
-                        </th>
-                        <th 
                           className="text-right py-2 px-3 text-slate-700 font-semibold w-24 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                           onClick={() => {
                             if (fileSortBy === "size") {
@@ -4768,28 +5020,33 @@ export default function Home() {
                         >
                           Velikost {fileSortBy === "size" && (fileSortDesc ? "↓" : "↑")}
                         </th>
-                        <th className="text-left py-2 px-3 text-slate-700 font-semibold border border-slate-300">
-                          Popis
-                        </th>
                       </tr>
                     </thead>
                     <tbody>
                       {displayedFiles.map((entry, idx) => (
                         <tr key={entry.path} className={idx % 2 === 0 ? "bg-white" : "bg-slate-50"}>
-                          <td className="text-center py-2 px-2 border border-slate-300 text-slate-600">
-                            {idx + 1}
+                          <td className="text-center py-2 px-2 border border-slate-300">
+                            <input
+                              type="checkbox"
+                              checked={selectedLocalFilePaths.has(entry.path)}
+                              onChange={() => {
+                                const next = new Set(selectedLocalFilePaths);
+                                if (next.has(entry.path)) {
+                                  next.delete(entry.path);
+                                  setSelectLocalFilesAllChecked(false);
+                                } else {
+                                  next.add(entry.path);
+                                }
+                                setSelectedLocalFilePaths(next);
+                              }}
+                              className="cursor-pointer"
+                            />
                           </td>
                           <td className="text-left py-2 px-3 border border-slate-300 text-slate-700 truncate" title={entry.path}>
                             {entry.path.split("/").pop() || entry.path}
                           </td>
                           <td className="text-right py-2 px-3 border border-slate-300 text-slate-700">
-                            —
-                          </td>
-                          <td className="text-right py-2 px-3 border border-slate-300 text-slate-700">
                             {entry.size ? (entry.size < 1024 ? `${entry.size}B` : entry.size < 1024*1024 ? `${(entry.size/1024).toFixed(1)}KB` : `${(entry.size/(1024*1024)).toFixed(1)}MB`) : "0B"}
-                          </td>
-                          <td className="text-left py-2 px-3 border border-slate-300 text-slate-600">
-                            —
                           </td>
                         </tr>
                       ))}
@@ -4797,6 +5054,22 @@ export default function Home() {
                   </table>
                 )}
               </div>
+              
+              {/* Tlačítko pro přidání do kontextu */}
+              {(selectedLocalFilePaths.size > 0 || (isAddingToContext && addContextMode === "local")) && (
+                <button
+                  onClick={isAddingToContext && addContextMode === "local" ? handleAbortAddToContext : handleAddLocalFilesToContext}
+                  className={`w-full px-4 py-2 text-sm font-semibold rounded-lg text-white transition ${
+                    isAddingToContext && addContextMode === "local"
+                      ? "bg-rose-600 hover:bg-rose-700"
+                      : "bg-blue-600 hover:bg-blue-700"
+                  }`}
+                >
+                  {isAddingToContext && addContextMode === "local"
+                    ? "⏹ Přerušit přidávání"
+                    : `+ Přidat ${selectedLocalFilePaths.size} ${selectedLocalFilePaths.size === 1 ? "soubor" : selectedLocalFilePaths.size < 5 ? "soubory" : "souborů"} do kontextu`}
+                </button>
+              )}
             </div>
           )}
         </section>
@@ -5159,19 +5432,15 @@ export default function Home() {
                         Zrušit filtry
                       </button>
                     )}
-                    {loadProgress && (
+                    {isAddingToContext && addContextMode === "samba" && (
                       <button
                         className="text-sm px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-semibold shadow-md transition"
-                        onClick={() => {
-                          if (addFilesAbortRef.current) {
-                            addFilesAbortRef.current.abort();
-                          }
-                        }}
+                        onClick={handleAbortAddToContext}
                       >
                         ⏹ Stop
                       </button>
                     )}
-                    {sambaFiles.filter((f) => f.type === "file").length > 0 && !loadProgress && (
+                    {sambaFiles.filter((f) => f.type === "file").length > 0 && !(isAddingToContext && addContextMode === "samba") && (
                       <button
                         className="text-sm px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold shadow-md transition"
                         onClick={handleAddAllSambaToContext}
@@ -5348,10 +5617,12 @@ export default function Home() {
             <div className="flex flex-col gap-3">
               <button
                 className="rounded-2xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-900"
-                onClick={handleAddToContext}
-                disabled={!results.length}
+                onClick={isAddingToContext && addContextMode === "results" ? handleAbortAddToContext : handleAddToContext}
+                disabled={!(isAddingToContext && addContextMode === "results") && !results.length}
               >
-                Přidat vybrané soubory do kontextu
+                {isAddingToContext && addContextMode === "results"
+                  ? "⏹ Přerušit přidávání"
+                  : "Přidat vybrané soubory do kontextu"}
               </button>
               <div className="flex flex-col gap-2">
                 <button
@@ -5361,7 +5632,7 @@ export default function Home() {
                       : "bg-amber-600 text-white hover:bg-amber-700"
                   } disabled:opacity-60 transition shadow-md`}
                   onClick={handleIndexFiles}
-                  disabled={fileContext.length === 0 || isIndexing || isRebuilding}
+                  disabled={!isSecretUnlocked || fileContext.length === 0 || isIndexing || isRebuilding}
                 >
                   {isIndexing
                     ? "Indexování..."
@@ -5385,7 +5656,7 @@ export default function Home() {
               <button
                 className="rounded-2xl border border-amber-500/60 px-4 py-2 text-sm font-semibold text-amber-200 hover:bg-amber-500/10 disabled:opacity-60"
                 onClick={() => handleRebuildIndex("truncate")}
-                disabled={isIndexing || isRebuilding}
+                disabled={!isSecretUnlocked || isIndexing || isRebuilding}
                 title="Vymaze obsah tabulky file_index bez zmeny schematu"
               >
                 {isRebuilding ? "Cistim..." : "Vymazat index"}
@@ -5393,7 +5664,7 @@ export default function Home() {
               <button
                 className="rounded-2xl border border-rose-500/60 px-4 py-2 text-sm font-semibold text-rose-200 hover:bg-rose-500/10 disabled:opacity-60"
                 onClick={() => handleRebuildIndex("drop")}
-                disabled={isIndexing || isRebuilding}
+                disabled={!isSecretUnlocked || isIndexing || isRebuilding}
                 title="Smaze tabulku file_index a bude nutne znovu indexovat"
               >
                 {isRebuilding ? "Rebuild..." : "Rebuild index"}
@@ -5575,16 +5846,20 @@ export default function Home() {
             <>
               {/* Status indikátor zdroje dat */}
               <div className={`flex items-center gap-2 rounded-xl px-3 py-2 text-xs ${
-                hasDbIndex
+                !isSecretUnlocked
+                  ? "bg-blue-500/10 border border-blue-500/30 text-blue-300"
+                  : hasDbIndex
                   ? "bg-emerald-500/10 border border-emerald-500/30 text-emerald-300"
                   : fileContext.length > 0
                     ? "bg-blue-500/10 border border-blue-500/30 text-blue-300"
                     : "bg-amber-500/10 border border-amber-500/30 text-amber-300"
               }`}>
                 <span className={`inline-block h-2 w-2 rounded-full ${
-                  hasDbIndex ? "bg-emerald-400 animate-pulse" : fileContext.length > 0 ? "bg-blue-400" : "bg-amber-400"
+                  !isSecretUnlocked ? "bg-blue-400" : hasDbIndex ? "bg-emerald-400 animate-pulse" : fileContext.length > 0 ? "bg-blue-400" : "bg-amber-400"
                 }`} />
-                {hasDbIndex ? (
+                {!isSecretUnlocked ? (
+                  <span>Lokální režim bez tajného slova — chat používá jen aktuálně načtený UI kontext.</span>
+                ) : hasDbIndex ? (
                   <span>
                     ✓ DB index připraven — vyhledávání funguje okamžitě
                     {knowledgeBase && knowledgeBase.totalFiles > 0 && (
