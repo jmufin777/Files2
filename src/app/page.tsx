@@ -32,6 +32,7 @@ type SambaStats = {
 
 type FileContext = {
   path: string;
+  folder?: string;
   content: string;
   size: number;
   lineCount: number;
@@ -815,6 +816,9 @@ async function collectFiles(
 ): Promise<FileEntry[]> {
   const entries: FileEntry[] = [];
   for await (const [name, handle] of dirHandle.entries()) {
+    if (name.startsWith(".")) {
+      continue;
+    }
     if (handle.kind === "directory") {
       if (SKIP_DIRS.has(name) || name.startsWith(".")) {
         continue;
@@ -1036,6 +1040,7 @@ async function ocrPdfText(
 }
 
 function buildContext(files: FileContext[]): string {
+  if (files.length === 0) return "";
   const TRUNC_MARKER = "\n\n[Context truncated]";
   const effectiveLimit = Math.max(0, MAX_CONTEXT_CHARS - TRUNC_MARKER.length);
 
@@ -1096,6 +1101,25 @@ function buildContext(files: FileContext[]): string {
     return `${output}${TRUNC_MARKER}`.slice(0, MAX_CONTEXT_CHARS);
   }
   return output;
+}
+
+function sanitizeIndexKeyPart(value: string): string {
+  return value.trim().replace(/[:]/g, "_");
+}
+
+function normalizeLocalPath(path: string, rootName?: string | null): string {
+  const trimmed = path.replace(/^\/+/, "");
+  if (!rootName) return trimmed;
+  const root = rootName.replace(/\/+$/, "");
+  return trimmed.startsWith(`${root}/`) ? trimmed.slice(root.length + 1) : trimmed;
+}
+
+function getFolderLabelFromPath(path: string, fallback?: string | null): string {
+  const normalized = path.replace(/^\/+/, "");
+  const parts = normalized.split("/");
+  if (parts.length > 1 && parts[0]) return parts[0];
+  const fallbackTrimmed = (fallback ?? "").trim();
+  return fallbackTrimmed || parts[0] || "local";
 }
 
 function getExtension(path: string): string {
@@ -1195,6 +1219,9 @@ function extractStructuredBlock(text: string): {
 }
 
 export default function Home() {
+  const [authEmail, setAuthEmail] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [directoryName, setDirectoryName] = useState<string | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [query, setQuery] = useState("");
@@ -1204,6 +1231,9 @@ export default function Home() {
   const [selectedLocalFilePaths, setSelectedLocalFilePaths] = useState<Set<string>>(new Set());
   const [selectLocalFilesAllChecked, setSelectLocalFilesAllChecked] = useState(false);
   const [fileContext, setFileContext] = useState<FileContext[]>([]);
+  const [localContentFilter, setLocalContentFilter] = useState("");
+  const [localContentMatches, setLocalContentMatches] = useState<Set<string> | null>(null);
+  const [localContentFiltering, setLocalContentFiltering] = useState(false);
   const [searchContent, setSearchContent] = useState(false);
   const [searchMode, setSearchMode] = useState<"and" | "or">("and"); // AND by default
   const [status, setStatus] = useState<string | null>(null);
@@ -1270,7 +1300,7 @@ export default function Home() {
   const [contextFilter, setContextFilter] = useState<string>("");
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [themeLoaded, setThemeLoaded] = useState(false);
-  const [contextSortBy, setContextSortBy] = useState<"name" | "lines" | "size" | "modified">("name");
+  const [contextSortBy, setContextSortBy] = useState<"name" | "folder" | "lines" | "size" | "modified">("name");
   const [contextSortDesc, setContextSortDesc] = useState(false);
   const [sambaSortBy, setSambaSortBy] = useState<"name" | "lines" | "size" | "modified">("name");
   const [sambaSortDesc, setSambaSortDesc] = useState(false);
@@ -1304,6 +1334,11 @@ export default function Home() {
 
   const normalizedSecretWord = secretWord.trim();
   const isSecretUnlocked = normalizedSecretWord.length >= 5;
+  const normalizedAuthEmail = (authEmail ?? "").toLowerCase().trim();
+  const userIndexKey = normalizedAuthEmail ? `user:${normalizedAuthEmail}` : null;
+  const localIndexKey = userIndexKey
+    ? `${userIndexKey}:${sanitizeIndexKeyPart(directoryName ?? "local")}`
+    : null;
 
   const contextsForSecret = useMemo(() => {
     if (!isSecretUnlocked) return [];
@@ -1594,6 +1629,11 @@ export default function Home() {
           const nameB = (b.path.split('/').pop() || b.path).toLowerCase();
           comparison = nameA.localeCompare(nameB);
           break;
+        case "folder":
+          const folderA = (a.folder || getFolderLabelFromPath(a.path)).toLowerCase();
+          const folderB = (b.folder || getFolderLabelFromPath(b.path)).toLowerCase();
+          comparison = folderA.localeCompare(folderB);
+          break;
         case "lines":
           comparison = (a.lineCount || 0) - (b.lineCount || 0);
           break;
@@ -1688,6 +1728,10 @@ export default function Home() {
         f.path.toLowerCase().includes(searchLower)
       );
     }
+
+    if (localContentFilter.trim() && localContentMatches) {
+      filtered = filtered.filter((f) => localContentMatches.has(f.path));
+    }
     
     // Sort
     const sorted = [...filtered];
@@ -1713,7 +1757,40 @@ export default function Home() {
     });
     
     return sorted;
-  }, [files, fileFilter, fileSortBy, fileSortDesc]);
+  }, [files, fileFilter, localContentFilter, localContentMatches, fileSortBy, fileSortDesc]);
+
+  // ── Auth session check on mount ──────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/auth/session");
+        if (cancelled) return;
+        const data = (await res.json()) as { authenticated?: boolean; email?: string };
+        if (data.authenticated && data.email) {
+          setAuthEmail(data.email);
+        }
+      } catch {
+        // ignore — middleware will redirect if not logged in
+      } finally {
+        if (!cancelled) setAuthLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleLogout = async () => {
+    try {
+      await fetch("/api/auth/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "logout" }),
+      });
+    } catch {
+      // ignore
+    }
+    window.location.href = "/login";
+  };
 
   // Theme initialization from localStorage (hydration-safe)
   useEffect(() => {
@@ -1924,8 +2001,16 @@ export default function Home() {
     );
   }, [activeContextId, isSecretUnlocked, normalizedSecretWord, savedContexts]);
 
+  const sambaIndexKey = useMemo(() => {
+    if (!isSecretUnlocked) return null;
+    if (activeContext?.secretKey && activeContext?.id) {
+      return `${activeContext.secretKey}:${activeContext.id}`;
+    }
+    return normalizedSecretWord || null;
+  }, [activeContext?.id, activeContext?.secretKey, isSecretUnlocked, normalizedSecretWord]);
+
   const hasDbIndex = useMemo(() => {
-    if (!isSecretUnlocked) return false;
+    if (!isSecretUnlocked && !localIndexKey) return false;
     return (
       isIndexed ||
       Boolean(activeContext?.lastIndexedAt) ||
@@ -1935,6 +2020,7 @@ export default function Home() {
     );
   }, [
     isSecretUnlocked,
+    localIndexKey,
     isIndexed,
     activeContext?.lastIndexedAt,
     dbIndexStatus.hasAnyIndex,
@@ -1944,7 +2030,7 @@ export default function Home() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!isSecretUnlocked) {
+    if (!isSecretUnlocked && !localIndexKey) {
       setDbIndexStatus({ checked: true, hasAnyIndex: false, hasContextIndex: false });
       return;
     }
@@ -1952,7 +2038,8 @@ export default function Home() {
 
     const run = async () => {
       try {
-        const contextId = activeContext?.id ? encodeURIComponent(activeContext.id) : "";
+        const scopeKey = sambaIndexKey ?? localIndexKey;
+        const contextId = scopeKey ? encodeURIComponent(scopeKey) : "";
         const url = contextId ? `/api/index/status?contextId=${contextId}` : "/api/index/status";
         const res = await fetch(url);
         const data = (await res.json()) as IndexStatusResponse;
@@ -1976,7 +2063,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [activeContext?.id, isSecretUnlocked]);
+  }, [activeContext?.id, isSecretUnlocked, localIndexKey, sambaIndexKey]);
 
   // Auto-load Samba file list when switching to a saved context with existing index
   const autoLoadedContextRef = useRef<string | null>(null);
@@ -2074,7 +2161,7 @@ export default function Home() {
   }, [activeContext?.id, isSecretUnlocked]);
 
   useEffect(() => {
-    if (isSecretUnlocked) return;
+    if (isSecretUnlocked || localIndexKey) return;
     autoLoadedContextRef.current = null;
     setSambaPath("");
     setSambaFiles([]);
@@ -2083,11 +2170,11 @@ export default function Home() {
     setKnowledgeBase(null);
     setDbIndexStatus({ checked: true, hasAnyIndex: false, hasContextIndex: false });
     setIsIndexed(false);
-  }, [isSecretUnlocked]);
+  }, [isSecretUnlocked, localIndexKey]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!isSecretUnlocked) {
+    if (!isSecretUnlocked && !localIndexKey) {
       setKnowledgeBase(null);
       return;
     }
@@ -2096,7 +2183,8 @@ export default function Home() {
 
     const loadKB = async () => {
       try {
-        const prefix = `${normalizedSecretWord}:`;
+        const prefixKey = sambaIndexKey ?? localIndexKey;
+        const prefix = prefixKey ? `${prefixKey}:` : "";
         const res = await fetch(`/api/knowledge-base/status?prefix=${encodeURIComponent(prefix)}`);
         const data = (await res.json()) as {
           initialized: boolean;
@@ -2125,7 +2213,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [isSecretUnlocked, normalizedSecretWord]);
+  }, [isSecretUnlocked, normalizedSecretWord, localIndexKey, sambaIndexKey]);
 
   const chartData = useMemo(() => {
     const sourcePaths: string[] = [];
@@ -2542,6 +2630,7 @@ export default function Home() {
         ...prev,
         {
           path: filePath,
+          folder: "Samba",
           content: text,
           size: data.textLength ?? 0,
           lineCount,
@@ -2669,6 +2758,7 @@ export default function Home() {
             ...prev,
             {
               path: file.path,
+              folder: "Samba",
               content: text,
               size: data.textLength ?? 0,
               lineCount,
@@ -2794,6 +2884,7 @@ export default function Home() {
         const lineCount = content.split('\n').length - (content.endsWith('\n') ? 1 : 0);
         newContext.push({
           path: entry.path,
+          folder: getFolderLabelFromPath(entry.path, directoryName),
           content,
           size: entry.size,
           lineCount,
@@ -2873,6 +2964,7 @@ export default function Home() {
         const lineCount = content.split('\n').length - (content.endsWith('\n') ? 1 : 0);
         newContext.push({
           path: entry.path,
+          folder: getFolderLabelFromPath(entry.path, directoryName),
           content,
           size: entry.size,
           lineCount,
@@ -3177,7 +3269,13 @@ export default function Home() {
         continue;
       }
 
-      batch.push({ path, content: text, size: text.length, lineCount: text.split('\n').length - (text.endsWith('\n') ? 1 : 0) });
+      batch.push({
+        path,
+        folder: getFolderLabelFromPath(path),
+        content: text,
+        size: text.length,
+        lineCount: text.split('\n').length - (text.endsWith('\n') ? 1 : 0),
+      });
       loaded += 1;
       if (batch.length >= BATCH_FLUSH) {
         const toAdd = batch.splice(0, batch.length);
@@ -3365,9 +3463,42 @@ export default function Home() {
     setFileContext((prev) => prev.filter((item) => item.path !== path));
   };
 
+  const runLocalContentFilter = async () => {
+    const needle = localContentFilter.trim();
+    if (!needle) {
+      setLocalContentMatches(null);
+      return;
+    }
+    setLocalContentFiltering(true);
+    setStatus("Filtruji obsah lokálních souborů...");
+    const matches = new Set<string>();
+    const needleLower = needle.toLowerCase();
+    const candidates = fileFilter.trim()
+      ? files.filter((f) => f.path.toLowerCase().includes(fileFilter.toLowerCase()))
+      : files;
+
+    for (let i = 0; i < candidates.length; i += 1) {
+      const entry = candidates[i];
+      try {
+        const text = await readFileText(entry, MAX_FILE_BYTES, ocrMaxPages);
+        if (text.toLowerCase().includes(needleLower)) {
+          matches.add(entry.path);
+        }
+      } catch {
+        // ignore per-file errors
+      }
+      if ((i + 1) % 25 === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    setLocalContentMatches(matches);
+    setLocalContentFiltering(false);
+    setStatus(`Obsahový filtr: ${matches.size} souborů`);
+  };
+
   const handleIndexFiles = async () => {
-    if (!isSecretUnlocked) {
-      setStatus("Zadejte platné přístupové slovo (min. 5 znaků) pro indexaci.");
+    if (!userIndexKey || !localIndexKey) {
+      setStatus("Pro indexaci lokálních souborů se musíte přihlásit.");
       return;
     }
     if (fileContext.length === 0) {
@@ -3378,7 +3509,17 @@ export default function Home() {
     setStatus("Indexing files...");
     setIndexProgress({ label: "Příprava", percent: 0 });
     try {
-      const contextPrefix = normalizedSecretWord ? `${normalizedSecretWord}:` : "";
+      const contextPrefix = `${localIndexKey}:`;
+      const normalizePath = (path: string) => normalizeLocalPath(path, directoryName);
+      const fileContextPaths = new Set(fileContext.map((f) => normalizePath(f.path)));
+      const allFolderPaths = files.map((f) => normalizePath(f.path));
+      const canDeleteMissing =
+        allFolderPaths.length > 0 &&
+        allFolderPaths.every((p) => fileContextPaths.has(p));
+      const knownSources = canDeleteMissing
+        ? allFolderPaths.map((p) => `${contextPrefix}${p}`)
+        : [];
+
       const filesPayload = fileContext.map((f, index) => {
         const percent = Math.round(((index + 1) / fileContext.length) * 50);
         setIndexProgress({
@@ -3386,7 +3527,7 @@ export default function Home() {
           percent,
         });
         return {
-          name: contextPrefix ? `${contextPrefix}${f.path}` : f.path,
+          name: `${contextPrefix}${normalizePath(f.path)}`,
           content: f.content,
         };
       });
@@ -3403,6 +3544,9 @@ export default function Home() {
         body: JSON.stringify({
           files: filesPayload,
           incremental: true, // Enable incremental indexing
+          scopePrefix: localIndexKey,
+          knownSources: canDeleteMissing ? knownSources : undefined,
+          deleteMissing: canDeleteMissing,
         }),
         signal: controller.signal,
       });
@@ -3439,14 +3583,16 @@ export default function Home() {
       
       // Update lastIndexedAt in settings
       const indexedAtIso = new Date().toISOString();
-      const nextSaved = buildSettingsFromCurrentUi({ lastIndexedAt: indexedAtIso });
-      setSecretWordSettings(nextSaved);
-      persistSecretWordSettings(normalizedSecretWord, nextSaved);
+      if (isSecretUnlocked) {
+        const nextSaved = buildSettingsFromCurrentUi({ lastIndexedAt: indexedAtIso });
+        setSecretWordSettings(nextSaved);
+        persistSecretWordSettings(normalizedSecretWord, nextSaved);
+      }
       
       // Refresh Knowledge Base status
-      if (isSecretUnlocked) {
+      if (localIndexKey) {
         try {
-          const prefix = `${normalizedSecretWord}:`;
+          const prefix = `${localIndexKey}:`;
           const kbRes = await fetch(`/api/knowledge-base/status?prefix=${encodeURIComponent(prefix)}`);
           const kbData = await kbRes.json();
           if (kbRes.ok) {
@@ -3691,7 +3837,7 @@ export default function Home() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              secretWord: normalizedSecretWord || undefined,
+              secretWord: (sambaIndexKey ?? localIndexKey) || undefined,
             }),
           });
           const data = (await response.json()) as {
@@ -3843,7 +3989,7 @@ export default function Home() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              secretWord: normalizedSecretWord || undefined,
+              secretWord: (sambaIndexKey ?? localIndexKey) || undefined,
             }),
           });
           const data = (await response.json()) as {
@@ -4179,15 +4325,21 @@ export default function Home() {
       // Check if UI filter is active
       const hasActiveFilter = contextFilter.trim().length > 0 && filteredContext.length !== fileContext.length;
       
-      // Use indexed search ONLY if available AND no active UI filter
-      // When filter is active, user explicitly wants to work with specific files
-      const useIndexedSearch = isSecretUnlocked && hasDbIndex && !hasActiveFilter;
+      // CRITICAL: Use local Gemini context whenever UI has loaded files.
+      // DB indexed search is ONLY for when the user has NO local files loaded
+      // and is relying purely on database index.
+      // This prevents data leaks: local folder users must never see DB data
+      // from other users/contexts, and DB users must stay within their scope.
+      const hasLocalContext = fileContext.length > 0;
+      const indexScopeKey = (sambaIndexKey || null) ?? localIndexKey;
+      const useIndexedSearch = Boolean(indexScopeKey) && hasDbIndex && !hasLocalContext;
       const endpoint = useIndexedSearch ? "/api/search" : "/api/gemini";
       
       console.log(`[Chat] Endpoint: ${endpoint}, Reason: ${
+        hasLocalContext ? `local context active (${fileContext.length} files)` :
         !hasDbIndex ? 'no index available' : 
-        hasActiveFilter ? `UI filter active (${filteredContext.length}/${fileContext.length} files)` :
-        'using indexed search'
+        !isSecretUnlocked ? 'no secret word' :
+        'no local files, using indexed search'
       }`);
       
       // Build body with filtering info
@@ -4202,7 +4354,7 @@ export default function Home() {
         useIndexedSearch
           ? JSON.stringify({ 
               query: trimmed, 
-              secretWord: normalizedSecretWord || undefined
+              secretWord: indexScopeKey || undefined
             })
           : JSON.stringify({ 
               message: trimmed, 
@@ -4449,21 +4601,37 @@ export default function Home() {
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <main className="mx-auto flex w-full max-w-[1600px] flex-col gap-10 px-6 py-12">
         <header className="flex flex-col gap-4 relative">
-          {/* Theme toggle button */}
-          {themeLoaded && (
-          <button
-            onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-            suppressHydrationWarning
-            className={`absolute top-0 right-0 p-2 rounded-lg transition shadow-md text-xl ${
-              theme === 'light' 
-                ? 'bg-slate-700 hover:bg-slate-600 text-yellow-300' 
-                : 'bg-slate-800 hover:bg-slate-700 text-orange-400'
-            }`}
-            title={theme === 'light' ? 'Přepnout na tmavý režim' : 'Přepnout na světlý režim'}
-          >
-            {theme === 'light' ? '🌙' : '☀️'}
-          </button>
-          )}
+          {/* Theme toggle + User info */}
+          <div className="absolute top-0 right-0 flex items-center gap-3">
+            {authEmail && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400 hidden sm:inline">
+                  {authEmail}
+                </span>
+                <button
+                  onClick={handleLogout}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition border border-slate-600"
+                  title="Odhlásit se"
+                >
+                  Odhlásit
+                </button>
+              </div>
+            )}
+            {themeLoaded && (
+            <button
+              onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+              suppressHydrationWarning
+              className={`p-2 rounded-lg transition shadow-md text-xl ${
+                theme === 'light' 
+                  ? 'bg-slate-700 hover:bg-slate-600 text-yellow-300' 
+                  : 'bg-slate-800 hover:bg-slate-700 text-orange-400'
+              }`}
+              title={theme === 'light' ? 'Přepnout na tmavý režim' : 'Přepnout na světlý režim'}
+            >
+              {theme === 'light' ? '🌙' : '☀️'}
+            </button>
+            )}
+          </div>
           <p className="text-sm uppercase tracking-[0.3em] text-slate-400">
             {/* Jardovo hledání */}
             Jardovo hledání
@@ -4975,13 +5143,57 @@ export default function Home() {
                 </div>
               </div>
               
-              {/* Filtr */}
-              <input
-                className="w-full text-xs rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-200 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none"
-                placeholder="Filtr souborů (např. .xlsx, 2019)"
-                value={fileFilter}
-                onChange={(e) => setFileFilter(e.target.value)}
-              />
+              {/* Filtr + obsah + OCR */}
+              <div className="grid gap-2 md:grid-cols-[1fr_1.2fr_1.8fr]">
+                <input
+                  className="w-full text-xs rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-200 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none"
+                  placeholder="Filtr souborů (např. .xlsx, 2019)"
+                  value={fileFilter}
+                  onChange={(e) => setFileFilter(e.target.value)}
+                />
+                <div className="flex items-center gap-2">
+                  <input
+                    className="w-full text-xs rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-200 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none"
+                    placeholder="Obsah souboru: faktura, smlouva"
+                    value={localContentFilter}
+                    onChange={(e) => setLocalContentFilter(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") runLocalContentFilter();
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={runLocalContentFilter}
+                    disabled={localContentFiltering || !localContentFilter.trim()}
+                    className="px-3 py-2 text-xs rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 font-semibold disabled:opacity-50 transition"
+                    title="Filtrovat podle obsahu (pomalejší)"
+                  >
+                    Obsah
+                  </button>
+                </div>
+                <div className="flex items-center justify-between gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-300">
+                  <span className="whitespace-nowrap">OCR str.</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    className="w-20 rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100"
+                    value={ocrMaxPages}
+                    onChange={(event) => {
+                      const next = Math.min(
+                        50,
+                        Math.max(1, Number(event.target.value) || 1)
+                      );
+                      setOcrMaxPages(next);
+                    }}
+                    title="OCR pro PDF: počet stránek"
+                  />
+                  <span className="text-[10px] text-slate-500">PDF</span>
+                </div>
+              </div>
+              {localContentFilter.trim() && !localContentMatches && (
+                <p className="text-[11px] text-slate-500">Zadejte obsah a stiskněte Enter nebo tlačítko Obsah.</p>
+              )}
               
               {/* Tabulka */}
               <div className="max-h-[60vh] overflow-auto border border-slate-700 rounded-lg">
@@ -5273,6 +5485,20 @@ export default function Home() {
                             Název souboru {contextSortBy === "name" && (contextSortDesc ? "↓" : "↑")}
                           </th>
                           <th 
+                            className="text-left py-2 px-3 text-slate-700 font-semibold w-32 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
+                            onClick={() => {
+                              if (contextSortBy === "folder") {
+                                setContextSortDesc(!contextSortDesc);
+                              } else {
+                                setContextSortBy("folder");
+                                setContextSortDesc(false);
+                              }
+                            }}
+                            title="Klikni pro třídění"
+                          >
+                            Složka {contextSortBy === "folder" && (contextSortDesc ? "↓" : "↑")}
+                          </th>
+                          <th 
                             className="text-right py-2 px-3 text-slate-700 font-semibold w-16 border border-slate-300 cursor-pointer hover:bg-slate-200 transition"
                             onClick={() => {
                               if (contextSortBy === "lines") {
@@ -5325,6 +5551,9 @@ export default function Home() {
                                 {item.path.split('/').pop() || item.path}
                               </span>
                               <span className="text-[10px] text-slate-500 block truncate">{item.path}</span>
+                            </td>
+                            <td className="py-2 px-3 border border-slate-300 text-slate-700">
+                              {item.folder || getFolderLabelFromPath(item.path)}
                             </td>
                             <td className="text-right py-2 px-3 text-slate-800 font-mono border border-slate-300">
                               {item.lineCount?.toLocaleString('cs-CZ') || '-'}
@@ -5915,7 +6144,8 @@ export default function Home() {
                   onChange={(event) => setChatInput(event.target.value)}
                 />
 
-                {chatSuggestions.length > 0 && (
+                {/* Našeptávač – dočasně skrytý */}
+                {false && chatSuggestions.length > 0 && (
                   <div className="md:col-span-3 flex flex-wrap items-center gap-2">
                     <span className="text-xs text-slate-500">Našeptávač:</span>
                     {chatSuggestions.map((item) => (

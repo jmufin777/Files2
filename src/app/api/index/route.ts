@@ -10,12 +10,23 @@ export const runtime = "nodejs";
 const VECTOR_TABLE_NAME = "file_index";
 const modelDimCache = new Map<string, number>();
 
+// Cache for resolved embedding model name (avoid calling Google Models API on every request)
+let resolvedModelCache: { model: string; dim: number | null; resolvedAt: number } | null = null;
+const MODEL_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+// Cache for Google models list
+let modelsListCache: { models: string[]; fetchedAt: number } | null = null;
+const MODELS_LIST_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
 type IndexRequest = {
   files: Array<{
     name: string;
     content: string;
   }>;
   incremental?: boolean;
+  scopePrefix?: string;
+  knownSources?: string[];
+  deleteMissing?: boolean;
 };
 
 function sha256Hex(text: string): string {
@@ -76,26 +87,42 @@ export async function POST(request: Request) {
     preferred?: string,
     targetDim?: number | null
   ): Promise<string> {
+    // Use cached result if available and not expired
+    if (
+      resolvedModelCache &&
+      Date.now() - resolvedModelCache.resolvedAt < MODEL_CACHE_TTL_MS &&
+      resolvedModelCache.dim === targetDim
+    ) {
+      return resolvedModelCache.model;
+    }
+
     const fallback = preferred || "text-embedding-004";
     try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
-        { method: "GET" }
-      );
-      if (!res.ok) return fallback;
-      const data = (await res.json()) as {
-        models?: Array<{
-          name?: string;
-          supportedGenerationMethods?: string[];
-        }>;
-      };
-      const candidates = (data.models || [])
-        .filter((m) =>
-          Array.isArray(m.supportedGenerationMethods) &&
-          m.supportedGenerationMethods.includes("embedContent") &&
-          typeof m.name === "string"
-        )
-        .map((m) => m.name as string);
+      // Use cached models list if available
+      let candidates: string[];
+      if (modelsListCache && Date.now() - modelsListCache.fetchedAt < MODELS_LIST_CACHE_TTL_MS) {
+        candidates = modelsListCache.models;
+      } else {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
+          { method: "GET" }
+        );
+        if (!res.ok) return fallback;
+        const data = (await res.json()) as {
+          models?: Array<{
+            name?: string;
+            supportedGenerationMethods?: string[];
+          }>;
+        };
+        candidates = (data.models || [])
+          .filter((m) =>
+            Array.isArray(m.supportedGenerationMethods) &&
+            m.supportedGenerationMethods.includes("embedContent") &&
+            typeof m.name === "string"
+          )
+          .map((m) => m.name as string);
+        modelsListCache = { models: candidates, fetchedAt: Date.now() };
+      }
 
       const normalize = (name: string) => name.replace(/^models\//, "");
       const preferredFull = preferred ? `models/${preferred}` : null;
@@ -104,28 +131,33 @@ export async function POST(request: Request) {
         ...candidates,
       ];
 
+      let resolved: string | null = null;
+
       if (targetDim) {
         for (const candidate of orderedCandidates) {
           const normalized = normalize(candidate);
           const dim = await getModelDimension(normalized);
           if (dim === targetDim) {
-            return normalized;
+            resolved = normalized;
+            break;
           }
         }
-        throw new Error(
-          `EMBEDDING_DIM_MISMATCH: Existing vectors are ${targetDim}D, but no supported model with embedContent matches this dimension. Reindex with a new table or rebuild embeddings.`
-        );
+        if (!resolved) {
+          throw new Error(
+            `EMBEDDING_DIM_MISMATCH: Existing vectors are ${targetDim}D, but no supported model with embedContent matches this dimension. Reindex with a new table or rebuild embeddings.`
+          );
+        }
+      } else if (preferredFull && candidates.includes(preferredFull)) {
+        resolved = normalize(preferredFull);
+      } else if (candidates.length > 0) {
+        resolved = normalize(candidates[0]);
+      } else {
+        resolved = fallback;
       }
 
-      if (preferredFull && candidates.includes(preferredFull)) {
-        return normalize(preferredFull);
-      }
-
-      if (candidates.length > 0) {
-        return normalize(candidates[0]);
-      }
-
-      return fallback;
+      // Cache the resolved model
+      resolvedModelCache = { model: resolved, dim: targetDim ?? null, resolvedAt: Date.now() };
+      return resolved;
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("EMBEDDING_DIM_MISMATCH:")) {
         throw error;
@@ -198,17 +230,6 @@ export async function POST(request: Request) {
       }
     }
 
-    // Initialize embeddings (with validation)
-    const targetDim = await getVectorColumnDimension(pool);
-    const embeddingModel = await resolveEmbeddingModel(
-      process.env.GEMINI_EMBEDDING_MODEL,
-      targetDim
-    );
-    const embeddings = new CheckedEmbeddings({
-      apiKey,
-      modelName: embeddingModel,
-    });
-
     // Process all files and create documents
     const documents: Array<{
       pageContent: string;
@@ -254,6 +275,30 @@ export async function POST(request: Request) {
       );
     }
 
+    // Optional: delete missing sources within a scope (local folder sync)
+    if (payload.deleteMissing && payload.scopePrefix) {
+      const scopeLike = `${payload.scopePrefix}:%`;
+      const known = Array.isArray(payload.knownSources) ? payload.knownSources : [];
+      try {
+        if (known.length > 0) {
+          await pool.query(
+            `DELETE FROM ${VECTOR_TABLE_NAME}
+             WHERE metadata->>'source' LIKE $1
+               AND NOT (metadata->>'source' = ANY($2))`,
+            [scopeLike, known]
+          );
+        } else {
+          await pool.query(
+            `DELETE FROM ${VECTOR_TABLE_NAME}
+             WHERE metadata->>'source' LIKE $1`,
+            [scopeLike]
+          );
+        }
+      } catch {
+        // Ignore delete errors to avoid blocking indexing
+      }
+    }
+
     const fileNames = preparedFiles.map((f) => f.name);
     const existingHashBySource = new Map<string, string>();
     if (payload.incremental) {
@@ -291,7 +336,7 @@ export async function POST(request: Request) {
       filesToIndex.push(file);
     }
 
-    // If everything is unchanged, succeed fast without embedding.
+    // If everything is unchanged, succeed fast WITHOUT calling Google API at all.
     if (filesToIndex.length === 0) {
       return NextResponse.json({
         success: true,
@@ -304,6 +349,18 @@ export async function POST(request: Request) {
         mode: payload.incremental ? "incremental" : "full",
       });
     }
+
+    // Initialize embeddings only AFTER confirming there are files to index
+    // (avoids expensive Google API calls when nothing changed)
+    const targetDim = await getVectorColumnDimension(pool);
+    const embeddingModel = await resolveEmbeddingModel(
+      process.env.GEMINI_EMBEDDING_MODEL,
+      targetDim
+    );
+    const embeddings = new CheckedEmbeddings({
+      apiKey,
+      modelName: embeddingModel,
+    });
 
     // If incremental mode, delete old chunks from changed files only.
     if (payload.incremental) {
@@ -366,10 +423,6 @@ export async function POST(request: Request) {
       );
     }
 
-    // Best-effort: compute the embedding dimension for visibility/debugging.
-    // (This also provides a quick fail-fast path if the embedding service returns empty vectors.)
-    const embeddingDimension = (await embeddings.embedQuery("dimension_check")).length;
-
     // Embed + filter out any empty vectors before inserting (prevents "vector must have at least 1 dimension").
     const vectors = await embeddings.embedDocuments(
       documents.map((d) => d.pageContent)
@@ -409,7 +462,7 @@ export async function POST(request: Request) {
       message: `Indexed ${filteredDocuments.length} chunks from ${payload.files.length} files.`,
       filesCount: payload.files.length,
       chunksCount: filteredDocuments.length,
-      embeddingDimension,
+      embeddingDimension: filteredVectors[0]?.length ?? null,
       totalChunksBeforeFiltering: totalChunks,
       skippedEmptyChunks,
       skippedFiles,

@@ -9,6 +9,14 @@ export const runtime = "nodejs";
 const VECTOR_TABLE_NAME = "file_index";
 const modelDimCache = new Map<string, number>();
 
+// Cache for resolved embedding model name (avoid calling Google Models API on every search)
+let resolvedModelCache: { model: string; dim: number | null; resolvedAt: number } | null = null;
+const MODEL_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+// Cache for Google models list
+let modelsListCache: { models: string[]; fetchedAt: number } | null = null;
+const MODELS_LIST_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
 type SearchRequest = {
   query: string;
   topK?: number;
@@ -72,26 +80,42 @@ export async function POST(request: Request) {
     preferred?: string,
     targetDim?: number | null
   ): Promise<string> {
+    // Use cached result if available and not expired
+    if (
+      resolvedModelCache &&
+      Date.now() - resolvedModelCache.resolvedAt < MODEL_CACHE_TTL_MS &&
+      resolvedModelCache.dim === targetDim
+    ) {
+      return resolvedModelCache.model;
+    }
+
     const fallback = preferred || "text-embedding-004";
     try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
-        { method: "GET" }
-      );
-      if (!res.ok) return fallback;
-      const data = (await res.json()) as {
-        models?: Array<{
-          name?: string;
-          supportedGenerationMethods?: string[];
-        }>;
-      };
-      const candidates = (data.models || [])
-        .filter((m) =>
-          Array.isArray(m.supportedGenerationMethods) &&
-          m.supportedGenerationMethods.includes("embedContent") &&
-          typeof m.name === "string"
-        )
-        .map((m) => m.name as string);
+      // Use cached models list if available
+      let candidates: string[];
+      if (modelsListCache && Date.now() - modelsListCache.fetchedAt < MODELS_LIST_CACHE_TTL_MS) {
+        candidates = modelsListCache.models;
+      } else {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
+          { method: "GET" }
+        );
+        if (!res.ok) return fallback;
+        const data = (await res.json()) as {
+          models?: Array<{
+            name?: string;
+            supportedGenerationMethods?: string[];
+          }>;
+        };
+        candidates = (data.models || [])
+          .filter((m) =>
+            Array.isArray(m.supportedGenerationMethods) &&
+            m.supportedGenerationMethods.includes("embedContent") &&
+            typeof m.name === "string"
+          )
+          .map((m) => m.name as string);
+        modelsListCache = { models: candidates, fetchedAt: Date.now() };
+      }
 
       const normalize = (name: string) => name.replace(/^models\//, "");
       const preferredFull = preferred ? `models/${preferred}` : null;
@@ -101,28 +125,33 @@ export async function POST(request: Request) {
         ...candidates,
       ];
 
+      let resolved: string | null = null;
+
       if (targetDim) {
         for (const candidate of orderedCandidates) {
           const normalized = normalize(candidate);
           const dim = await getModelDimension(normalized);
           if (dim === targetDim) {
-            return normalized;
+            resolved = normalized;
+            break;
           }
         }
-        throw new Error(
-          `EMBEDDING_DIM_MISMATCH: Existing vectors are ${targetDim}D, but no supported model with embedContent matches this dimension. Reindex with a new table or rebuild embeddings.`
-        );
+        if (!resolved) {
+          throw new Error(
+            `EMBEDDING_DIM_MISMATCH: Existing vectors are ${targetDim}D, but no supported model with embedContent matches this dimension. Reindex with a new table or rebuild embeddings.`
+          );
+        }
+      } else if (preferredFull && candidates.includes(preferredFull)) {
+        resolved = normalize(preferredFull);
+      } else if (candidates.length > 0) {
+        resolved = normalize(candidates[0]);
+      } else {
+        resolved = fallback;
       }
 
-      if (preferredFull && candidates.includes(preferredFull)) {
-        return normalize(preferredFull);
-      }
-
-      if (candidates.length > 0) {
-        return normalize(candidates[0]);
-      }
-
-      return fallback;
+      // Cache the resolved model
+      resolvedModelCache = { model: resolved, dim: targetDim ?? null, resolvedAt: Date.now() };
+      return resolved;
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("EMBEDDING_DIM_MISMATCH:")) {
         throw error;

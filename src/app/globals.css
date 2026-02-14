@@ -34,12 +34,16 @@ body {
 /* Light theme overrides for hard-coded dark utility classes */
 .light-theme .bg-slate-950 { background-color: #ffffff !important; }
 .light-theme .bg-slate-900\/60 { background-color: rgba(241, 245, 249, 0.95) !important; }
+.light-theme .bg-slate-900\/80 { background-color: rgba(241, 245, 249, 0.98) !important; }
 .light-theme .bg-slate-900\/50 { background-color: rgba(241, 245, 249, 0.9) !important; }
 .light-theme .bg-slate-900\/40 { background-color: rgba(241, 245, 249, 0.85) !important; }
 .light-theme .bg-slate-900\/35 { background-color: rgba(241, 245, 249, 0.8) !important; }
 .light-theme .bg-slate-900\/30 { background-color: rgba(241, 245, 249, 0.75) !important; }
 .light-theme .bg-slate-900\/20 { background-color: rgba(241, 245, 249, 0.7) !important; }
+.light-theme .bg-slate-900 { background-color: #f1f5f9 !important; }
 .light-theme .bg-slate-800 { background-color: #f1f5f9 !important; }
+.light-theme .bg-slate-700 { background-color: #e2e8f0 !important; }
+.light-theme .bg-slate-600 { background-color: #cbd5e1 !important; }
 .light-theme .bg-slate-800\/50 { background-color: rgba(226, 232, 240, 0.7) !important; }
 .light-theme .bg-slate-800\/40 { background-color: rgba(226, 232, 240, 0.6) !important; }
 
